@@ -1,0 +1,6 @@
+path: datasets/patch_yolo
+train: images/train
+val: images/val
+names:
+  0: patch
+

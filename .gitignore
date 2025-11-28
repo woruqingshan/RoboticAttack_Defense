@@ -1,0 +1,3 @@
+
+# never commit git internal backups
+**/.git.bak*

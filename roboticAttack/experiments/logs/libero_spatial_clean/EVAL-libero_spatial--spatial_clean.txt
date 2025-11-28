@@ -1,0 +1,721 @@
+Task suite: libero_spatial
+Log Path:./experiments/logs/libero_spatial_clean/libero_spatial/.txt
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=1--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 1
+# successes: 1 (100.0%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=2--success=False--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: False
+# episodes completed so far: 2
+# successes: 1 (50.0%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=3--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 3
+# successes: 2 (66.7%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=4--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 4
+# successes: 3 (75.0%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=5--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 5
+# successes: 4 (80.0%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=6--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 6
+# successes: 5 (83.3%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=7--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 7
+# successes: 6 (85.7%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=8--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 8
+# successes: 7 (87.5%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=9--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 9
+# successes: 8 (88.9%)
+
+Task: pick up the black bowl between the plate and the ramekin and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=10--success=True--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: True
+# episodes completed so far: 10
+# successes: 9 (90.0%)
+Current task success rate: 0.9
+Current total success rate: 0.9
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=11--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 11
+# successes: 10 (90.9%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=12--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 12
+# successes: 11 (91.7%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=13--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 13
+# successes: 12 (92.3%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=14--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 14
+# successes: 13 (92.9%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=15--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 15
+# successes: 14 (93.3%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=16--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 16
+# successes: 15 (93.8%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=17--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 17
+# successes: 16 (94.1%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=18--success=False--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: False
+# episodes completed so far: 18
+# successes: 16 (88.9%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=19--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 19
+# successes: 17 (89.5%)
+
+Task: pick up the black bowl next to the ramekin and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=20--success=True--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: True
+# episodes completed so far: 20
+# successes: 18 (90.0%)
+Current task success rate: 0.9
+Current total success rate: 0.9
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=21--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 21
+# successes: 19 (90.5%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=22--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 22
+# successes: 20 (90.9%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=23--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 23
+# successes: 21 (91.3%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=24--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 24
+# successes: 22 (91.7%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=25--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 25
+# successes: 23 (92.0%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=26--success=False--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: False
+# episodes completed so far: 26
+# successes: 23 (88.5%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=27--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 27
+# successes: 24 (88.9%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=28--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 28
+# successes: 25 (89.3%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=29--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 29
+# successes: 26 (89.7%)
+
+Task: pick up the black bowl from table center and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=30--success=True--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: True
+# episodes completed so far: 30
+# successes: 27 (90.0%)
+Current task success rate: 0.9
+Current total success rate: 0.9
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=31--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 31
+# successes: 28 (90.3%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=32--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 32
+# successes: 29 (90.6%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=33--success=False--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: False
+# episodes completed so far: 33
+# successes: 29 (87.9%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=34--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 34
+# successes: 30 (88.2%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=35--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 35
+# successes: 31 (88.6%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=36--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 36
+# successes: 32 (88.9%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=37--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 37
+# successes: 33 (89.2%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=38--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 38
+# successes: 34 (89.5%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=39--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 39
+# successes: 35 (89.7%)
+
+Task: pick up the black bowl on the cookie box and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=40--success=True--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: True
+# episodes completed so far: 40
+# successes: 36 (90.0%)
+Current task success rate: 0.9
+Current total success rate: 0.9
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=41--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 41
+# successes: 37 (90.2%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=42--success=False--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: False
+# episodes completed so far: 42
+# successes: 37 (88.1%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=43--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 43
+# successes: 38 (88.4%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=44--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 44
+# successes: 39 (88.6%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=45--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 45
+# successes: 40 (88.9%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=46--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 46
+# successes: 41 (89.1%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=47--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 47
+# successes: 42 (89.4%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=48--success=False--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: False
+# episodes completed so far: 48
+# successes: 42 (87.5%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=49--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 49
+# successes: 43 (87.8%)
+
+Task: pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=50--success=True--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: True
+# episodes completed so far: 50
+# successes: 44 (88.0%)
+Current task success rate: 0.8
+Current total success rate: 0.88
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=51--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 51
+# successes: 45 (88.2%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=52--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 52
+# successes: 46 (88.5%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=53--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 53
+# successes: 47 (88.7%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=54--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 54
+# successes: 48 (88.9%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=55--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 55
+# successes: 49 (89.1%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=56--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 56
+# successes: 50 (89.3%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=57--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 57
+# successes: 51 (89.5%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=58--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 58
+# successes: 52 (89.7%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=59--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 59
+# successes: 53 (89.8%)
+
+Task: pick up the black bowl on the ramekin and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=60--success=True--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: True
+# episodes completed so far: 60
+# successes: 54 (90.0%)
+Current task success rate: 1.0
+Current total success rate: 0.9
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=61--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 61
+# successes: 55 (90.2%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=62--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 62
+# successes: 56 (90.3%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=63--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 63
+# successes: 57 (90.5%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=64--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 64
+# successes: 58 (90.6%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=65--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 65
+# successes: 59 (90.8%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=66--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 66
+# successes: 60 (90.9%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=67--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 67
+# successes: 61 (91.0%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=68--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 68
+# successes: 62 (91.2%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=69--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 69
+# successes: 63 (91.3%)
+
+Task: pick up the black bowl next to the cookie box and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=70--success=True--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: True
+# episodes completed so far: 70
+# successes: 64 (91.4%)
+Current task success rate: 1.0
+Current total success rate: 0.9142857142857143
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=71--success=False--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: False
+# episodes completed so far: 71
+# successes: 64 (90.1%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=72--success=False--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: False
+# episodes completed so far: 72
+# successes: 64 (88.9%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=73--success=True--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: True
+# episodes completed so far: 73
+# successes: 65 (89.0%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=74--success=True--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: True
+# episodes completed so far: 74
+# successes: 66 (89.2%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=75--success=True--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: True
+# episodes completed so far: 75
+# successes: 67 (89.3%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=76--success=True--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: True
+# episodes completed so far: 76
+# successes: 68 (89.5%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=77--success=True--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: True
+# episodes completed so far: 77
+# successes: 69 (89.6%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=78--success=False--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: False
+# episodes completed so far: 78
+# successes: 69 (88.5%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=79--success=True--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: True
+# episodes completed so far: 79
+# successes: 70 (88.6%)
+
+Task: pick up the black bowl on the stove and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=80--success=False--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: False
+# episodes completed so far: 80
+# successes: 70 (87.5%)
+Current task success rate: 0.6
+Current total success rate: 0.875
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=81--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 81
+# successes: 71 (87.7%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=82--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 82
+# successes: 72 (87.8%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=83--success=False--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: False
+# episodes completed so far: 83
+# successes: 72 (86.7%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=84--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 84
+# successes: 73 (86.9%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=85--success=False--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: False
+# episodes completed so far: 85
+# successes: 73 (85.9%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=86--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 86
+# successes: 74 (86.0%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=87--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 87
+# successes: 75 (86.2%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=88--success=False--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: False
+# episodes completed so far: 88
+# successes: 75 (85.2%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=89--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 89
+# successes: 76 (85.4%)
+
+Task: pick up the black bowl next to the plate and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=90--success=True--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: True
+# episodes completed so far: 90
+# successes: 77 (85.6%)
+Current task success rate: 0.7
+Current total success rate: 0.8555555555555555
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 1...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=91--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 91
+# successes: 78 (85.7%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 2...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=92--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 92
+# successes: 79 (85.9%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 3...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=93--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 93
+# successes: 80 (86.0%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 4...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=94--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 94
+# successes: 81 (86.2%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 5...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=95--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 95
+# successes: 82 (86.3%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 6...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=96--success=False--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: False
+# episodes completed so far: 96
+# successes: 82 (85.4%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 7...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=97--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 97
+# successes: 83 (85.6%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 8...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=98--success=False--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: False
+# episodes completed so far: 98
+# successes: 83 (84.7%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 9...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=99--success=False--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: False
+# episodes completed so far: 99
+# successes: 83 (83.8%)
+
+Task: pick up the black bowl on the wooden cabinet and place it on the plate
+Starting episode 10...
+Saved rollout MP4 at path ./rollouts/./experiments/logs/libero_spatial_clean/spatial_clean/2025_11_16/2025_11_16-16_05_00--episode=100--success=True--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: True
+# episodes completed so far: 100
+# successes: 84 (84.0%)
+Current task success rate: 0.7
+Current total success rate: 0.84
