@@ -175,6 +175,7 @@ def cls_to_patch_attention(
     cls_index: int = 0,
     exclude_cls: bool = True,
     patch_token_count: Optional[int] = None,
+    special_token_count: int = 0,
 ) -> torch.Tensor:
     """
     Extract the attention from CLS token to vision patch tokens.
@@ -199,6 +200,18 @@ def cls_to_patch_attention(
     if exclude_cls:
         cls_vector = cls_vector[:, 1:]  # [B, N-1]
     
+    # Skip additional register/special tokens that appear after the CLS token
+    if special_token_count > 0:
+        if cls_vector.shape[-1] <= special_token_count:
+            raise ValueError(
+                f"Cannot skip {special_token_count} tokens when only {cls_vector.shape[-1]} remain."
+            )
+        cls_vector = cls_vector[:, special_token_count:]
+        print(
+            f"[SAL] Skipped {special_token_count} register/special tokens "
+            "following the CLS token."
+        )
+    
     # If we know how many patch tokens exist, drop any extra special tokens
     if (patch_token_count is not None) and (cls_vector.shape[-1] > patch_token_count):
         before_truncate = cls_vector.shape[-1]
@@ -212,7 +225,8 @@ def cls_to_patch_attention(
 def attention_vector_to_grid(
     attn_vector: torch.Tensor,
     patch_token_count: Optional[int] = None,
-) -> Tuple[torch.Tensor, int]:
+    grid_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Reshape a 1D attention vector into a 2D patch grid.
 
@@ -223,7 +237,7 @@ def attention_vector_to_grid(
 
     Returns:
         grid: [B, H, W] attention map.
-        grid_size: H == W if possible.
+        (H, W): Grid dimensions, even when not square.
     """
     # If caller knows the true number of patches, respect it first
     if (patch_token_count is not None) and (attn_vector.shape[-1] >= patch_token_count):
@@ -231,6 +245,19 @@ def attention_vector_to_grid(
         token_count = patch_token_count
     else:
         token_count = attn_vector.shape[-1]
+    
+    # When grid_shape is known, trust it before falling back to heuristics
+    if grid_shape is not None:
+        grid_h, grid_w = int(grid_shape[0]), int(grid_shape[1])
+        required_tokens = grid_h * grid_w
+        if token_count < required_tokens:
+            raise ValueError(
+                f"Attention vector has {token_count} tokens but {required_tokens} "
+                f"are required to form a {grid_h}x{grid_w} grid."
+            )
+        attn_vector = attn_vector[..., :required_tokens]
+        grid = attn_vector.view(attn_vector.shape[0], grid_h, grid_w)
+        return grid, (grid_h, grid_w)
     
     grid_size = int(token_count ** 0.5)
     
@@ -271,7 +298,7 @@ def attention_vector_to_grid(
     # Now safely reshape into a square grid
     bsz = attn_vector.shape[0]
     grid = attn_vector.view(bsz, grid_size, grid_size)
-    return grid, grid_size
+    return grid, (grid_size, grid_size)
 
 
 def compute_gradcam_weights(activations: torch.Tensor, grads: torch.Tensor) -> torch.Tensor:

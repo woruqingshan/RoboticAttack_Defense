@@ -106,21 +106,38 @@ class VLAAttentionExtractor:
         self.image_size = image_size
         self.instruction_template = instruction_template
 
-        # Get the number of vision patches from the model
+        # Get the number of vision patches and register token metadata
         self.num_patches = None
+        self.patch_grid_hw: Optional[Tuple[int, int]] = None
+        self.special_token_count = 0
         vision_backbone = getattr(self.model, "vision_backbone", None)
         if vision_backbone is not None:
             featurizer = getattr(vision_backbone, "featurizer", None)
             if featurizer is not None:
                 patch_embed = getattr(featurizer, "patch_embed", None)
-                if patch_embed is not None and hasattr(patch_embed, "num_patches"):
-                    self.num_patches = int(patch_embed.num_patches)
+                if patch_embed is not None:
+                    if hasattr(patch_embed, "num_patches"):
+                        self.num_patches = int(patch_embed.num_patches)
+                    if hasattr(patch_embed, "grid_size"):
+                        grid_size = patch_embed.grid_size
+                        if isinstance(grid_size, (tuple, list)):
+                            self.patch_grid_hw = (int(grid_size[0]), int(grid_size[1]))
+                        else:
+                            dim = int(grid_size)
+                            self.patch_grid_hw = (dim, dim)
+                self.special_token_count = self._infer_register_token_count(featurizer)
         
         if self.num_patches is not None:
             print(f"[SAL] Detected {self.num_patches} vision patches per image.")
         else:
             print("[SAL] WARNING: Could not infer patch token count; "
                   "falling back to heuristic grid inference.")
+        if self.patch_grid_hw is not None:
+            print(f"[SAL] Inferred patch grid: {self.patch_grid_hw[0]}x{self.patch_grid_hw[1]}")
+        else:
+            print("[SAL] WARNING: Patch grid size unknown; using square heuristic.")
+        if self.special_token_count > 0:
+            print(f"[SAL] Detected {self.special_token_count} register/special tokens after CLS.")
 
         self.hooks = AttentionHookManager()
         self.attn_cache_key = "vision_attn"
@@ -414,6 +431,7 @@ class VLAAttentionExtractor:
             aggregated,
             exclude_cls=True,
             patch_token_count=self.num_patches,
+            special_token_count=self.special_token_count,
         )
         
         # Print CLS vector truncation info
@@ -422,15 +440,35 @@ class VLAAttentionExtractor:
                   f"(kept first {self.num_patches} patch tokens)")
         
         # Map 1D attention vector to 2D grid
-        grid, grid_size = attention_vector_to_grid(
+        grid, grid_shape = attention_vector_to_grid(
             cls_vec,
             patch_token_count=self.num_patches,
+            grid_shape=self.patch_grid_hw,
         )
         
-        print(f"[SAL] Reshaped to grid: {grid_size}x{grid_size}")
+        print(f"[SAL] Reshaped to grid: {grid_shape[0]}x{grid_shape[1]}")
         
         grid = grid[0].unsqueeze(0).unsqueeze(0)
         upsampled = F.interpolate(grid, size=(self.image_size, self.image_size), mode="bicubic", align_corners=False)
         saliency = upsampled.squeeze().cpu().numpy()
         return saliency
+
+    def _infer_register_token_count(self, featurizer: torch.nn.Module) -> int:
+        """Best-effort detection of register/special tokens following CLS."""
+        candidate_counts: List[int] = []
+        
+        num_prefix = getattr(featurizer, "num_prefix_tokens", None)
+        if num_prefix is not None:
+            # num_prefix_tokens usually counts CLS + register tokens
+            candidate_counts.append(max(0, int(num_prefix) - 1))
+        
+        register_tokens = getattr(featurizer, "register_tokens", None)
+        if register_tokens is not None and hasattr(register_tokens, "shape"):
+            candidate_counts.append(int(register_tokens.shape[1]))
+        
+        global_tokens = getattr(featurizer, "global_tokens", None)
+        if global_tokens is not None and hasattr(global_tokens, "shape"):
+            candidate_counts.append(int(global_tokens.shape[1]))
+        
+        return max(candidate_counts) if candidate_counts else 0
 
