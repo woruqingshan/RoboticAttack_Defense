@@ -15,12 +15,21 @@ from evaluation_tool.saliency import VLAAttentionExtractor, save_overlay_heatmap
 '''
 
 python scripts/dump_vla_saliency.py \
-  --episode-path rollouts/rollouts/libero_object/object_xy_174_174/2025_11_19/2025_11_19-16_51_12--episode=1--success=False--task=pick_up_the_alphabet_soup_and_place_it_in_the_bask.mp4 \
-  --out-dir results/saliency/libero_object/object_xy_174_174_ep1 \
+  --episode-path rollouts/rollouts/libero_object/object_xy_20_164/2025_11_19/2025_11_19-16_40_25--episode=1--success=False--task=pick_up_the_alphabet_soup_and_place_it_in_the_bask.mp4 \
+  --out-dir results/saliency/libero_object/object_xy_20_164/ep1 \
   --instruction "pick up the alphabet soup and place it in the basket" \
   --dataset libero_object \
   --frame-stride 10 \
-  --device cuda:2 \
+  --device cuda:1 \
+  --model-root /data/zifeng/siyuan/data/models
+
+python scripts/dump_vla_saliency.py \
+  --episode-path rollouts/rollouts/libero_object_clean/object_clean/2025_11_16/2025_11_16-17_13_41--episode=11--success=True--task=pick_up_the_cream_cheese_and_place_it_in_the_baske.mp4 \
+  --out-dir results/saliency/libero_object_clean/object_clean/ep2 \
+  --instruction "pick up the cream cheese and place it in the basket" \
+  --dataset libero_object \
+  --frame-stride 10 \
+  --device cuda:1 \
   --model-root /data/zifeng/siyuan/data/models
 
 '''
