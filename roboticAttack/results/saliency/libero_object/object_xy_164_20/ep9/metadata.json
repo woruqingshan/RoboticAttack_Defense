@@ -1,0 +1,16 @@
+{
+  "episode_path": "/home/zifeng/siyuan/code/roboticAttack/rollouts/rollouts/libero_object/object_xy_164_20/2025_11_19/2025_11_19-15_02_33--episode=8--success=False--task=pick_up_the_milk_and_place_it_in_the_basket.mp4",
+  "instruction": "pick up the milk and place it in the basket",
+  "dataset": "libero_object",
+  "frame_stride": 10,
+  "frame_limit": null,
+  "attn_module": null,
+  "processed_frames": 26,
+  "task_id": 9,
+  "task_text": "pick_up_the_milk_and_place_it_in_the_basket",
+  "episode_id": 8,
+  "is_attack": true,
+  "patch_tag": "object_xy_164_20",
+  "repeat_slot": null,
+  "source_video": "rollouts/rollouts/libero_object/object_xy_164_20/2025_11_19/2025_11_19-15_02_33--episode=8--success=False--task=pick_up_the_milk_and_place_it_in_the_basket.mp4"
+}

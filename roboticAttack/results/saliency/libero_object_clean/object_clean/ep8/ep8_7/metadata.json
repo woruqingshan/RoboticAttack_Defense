@@ -1,0 +1,16 @@
+{
+  "episode_path": "/home/zifeng/siyuan/code/roboticAttack/rollouts/rollouts/libero_object_clean/object_clean/2025_11_16/2025_11_16-17_13_41--episode=67--success=True--task=pick_up_the_butter_and_place_it_in_the_basket.mp4",
+  "instruction": "pick up the butter and place it in the basket",
+  "dataset": "libero_object",
+  "frame_stride": 10,
+  "frame_limit": null,
+  "attn_module": null,
+  "processed_frames": 16,
+  "task_id": 8,
+  "task_text": "pick_up_the_butter_and_place_it_in_the_basket",
+  "episode_id": 67,
+  "is_attack": false,
+  "patch_tag": null,
+  "repeat_slot": 7,
+  "source_video": "rollouts/rollouts/libero_object_clean/object_clean/2025_11_16/2025_11_16-17_13_41--episode=67--success=True--task=pick_up_the_butter_and_place_it_in_the_basket.mp4"
+}

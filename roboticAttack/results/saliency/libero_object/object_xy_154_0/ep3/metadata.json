@@ -1,0 +1,16 @@
+{
+  "episode_path": "/home/zifeng/siyuan/code/roboticAttack/rollouts/rollouts/libero_object/object_xy_154_0/2025_11_19/2025_11_19-14_08_32--episode=2--success=False--task=pick_up_the_cream_cheese_and_place_it_in_the_baske.mp4",
+  "instruction": "pick up the cream cheese and place it in the baske",
+  "dataset": "libero_object",
+  "frame_stride": 10,
+  "frame_limit": null,
+  "attn_module": null,
+  "processed_frames": 26,
+  "task_id": 3,
+  "task_text": "pick_up_the_cream_cheese_and_place_it_in_the_baske",
+  "episode_id": 2,
+  "is_attack": true,
+  "patch_tag": "object_xy_154_0",
+  "repeat_slot": null,
+  "source_video": "rollouts/rollouts/libero_object/object_xy_154_0/2025_11_19/2025_11_19-14_08_32--episode=2--success=False--task=pick_up_the_cream_cheese_and_place_it_in_the_baske.mp4"
+}

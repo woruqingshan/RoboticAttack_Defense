@@ -1,0 +1,16 @@
+{
+  "episode_path": "/home/zifeng/siyuan/code/roboticAttack/rollouts/rollouts/libero_object/object_xy_24_24/2025_11_16/2025_11_16-14_12_25--episode=100--success=False--task=pick_up_the_orange_juice_and_place_it_in_the_baske.mp4",
+  "instruction": "pick up the orange juice and place it in the baske",
+  "dataset": "libero_object",
+  "frame_stride": 10,
+  "frame_limit": null,
+  "attn_module": null,
+  "processed_frames": 26,
+  "task_id": 2,
+  "task_text": "pick_up_the_orange_juice_and_place_it_in_the_baske",
+  "episode_id": 100,
+  "is_attack": true,
+  "patch_tag": "object_xy_24_24",
+  "repeat_slot": null,
+  "source_video": "rollouts/rollouts/libero_object/object_xy_24_24/2025_11_16/2025_11_16-14_12_25--episode=100--success=False--task=pick_up_the_orange_juice_and_place_it_in_the_baske.mp4"
+}

@@ -1,9 +1,16 @@
 {
   "episode_path": "/home/zifeng/siyuan/code/roboticAttack/rollouts/rollouts/libero_object/object_xy_174_174/2025_11_19/2025_11_19-16_51_12--episode=1--success=False--task=pick_up_the_alphabet_soup_and_place_it_in_the_bask.mp4",
-  "instruction": "pick up the alphabet soup and place it in the basket",
+  "instruction": "pick up the alphabet soup and place it in the bask",
   "dataset": "libero_object",
   "frame_stride": 10,
   "frame_limit": null,
   "attn_module": null,
-  "processed_frames": 26
+  "processed_frames": 26,
+  "task_id": 1,
+  "task_text": "pick_up_the_alphabet_soup_and_place_it_in_the_bask",
+  "episode_id": 1,
+  "is_attack": true,
+  "patch_tag": "object_xy_174_174",
+  "repeat_slot": null,
+  "source_video": "rollouts/rollouts/libero_object/object_xy_174_174/2025_11_19/2025_11_19-16_51_12--episode=1--success=False--task=pick_up_the_alphabet_soup_and_place_it_in_the_bask.mp4"
 }
