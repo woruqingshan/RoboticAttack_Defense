@@ -58,9 +58,18 @@ def get_libero_image(obs, resize_size):
     return img
 
 
-def save_rollout_video(rollout_images, idx, success, task_description, log_file=None,exp_name="test"):
+def save_rollout_video(
+    rollout_images,
+    idx,
+    success,
+    task_description,
+    log_file=None,
+    exp_name="test",
+    rollout_root_dir="./rollouts",
+):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{exp_name}/{DATE}"
+    # NOTE: rollout_root_dir can be an absolute path (e.g., /data/.../test) to keep large artifacts off system disks.
+    rollout_dir = os.path.join(str(rollout_root_dir), str(exp_name), DATE)
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
     mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"

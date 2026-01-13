@@ -23,6 +23,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+# CRITICAL: Set CUDA_VISIBLE_DEVICES BEFORE importing torch or any CUDA-using modules
+# Parse --cudaid from command line arguments early to set environment variable
+# This allows multiple terminals to use different GPUs independently
+if '--cudaid' in sys.argv:
+    cudaid_idx = sys.argv.index('--cudaid')
+    if cudaid_idx + 1 < len(sys.argv):
+        cudaid_value = sys.argv[cudaid_idx + 1]
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cudaid_value)
+        print(f"[*] Early setting: CUDA_VISIBLE_DEVICES={cudaid_value} (before torch import)")
+
 # Set MuJoCo rendering backend for headless environments
 # This must be set BEFORE importing mujoco/robosuite
 # System-level graphics libraries are required for rendering
@@ -47,6 +57,7 @@ from libero.libero import benchmark
 
 import wandb
 import sys
+from typing import Optional
 
 # Add white_patch directory to path for RandomPatchTransform
 WHITE_PATCH_DIR = os.path.join(os.path.dirname(__file__), "../../../VLAAttacker/white_patch")
@@ -60,6 +71,9 @@ import random
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
+ROBOTIC_ATTACK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+if ROBOTIC_ATTACK_ROOT not in sys.path:
+    sys.path.insert(0, ROBOTIC_ATTACK_ROOT)
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -77,6 +91,67 @@ from experiments.robot.robot_utils import (
     normalize_gripper_action,
     set_seed_everywhere,
 )
+
+from evaluation_tool.defense import (
+    ImagePurifier,
+    OnlineAttentionHook,
+    PatchAttentionAnomalyDetector,
+    PatchBox,
+)
+
+def _defense_debug_print(cfg, msg: str, log_file=None) -> None:
+    """Print defense debug logs when enabled."""
+    if not getattr(cfg, "defense_debug", False):
+        return
+    print(msg)
+    if log_file is not None:
+        log_file.write(msg + "\n")
+
+def _defense_debug_every_step(cfg) -> bool:
+    """Return True when step-level defense debug logs are enabled."""
+    return bool(getattr(cfg, "defense_debug", False) and getattr(cfg, "defense_debug_every_step", False))
+
+def _normalize_heatmap_uint8(heatmap) -> "np.ndarray":
+    """Normalize a float heatmap into uint8 [0,255] for visualization."""
+    hm = heatmap.astype(np.float32)
+    hm = hm - float(hm.min())
+    denom = float(hm.max()) + 1e-6
+    hm = hm / denom
+    return (hm * 255.0).clip(0, 255).astype("uint8")
+
+def _make_overlay_rgb(image_rgb, heatmap, alpha: float):
+    """
+    Create an RGB overlay image using a heatmap (JET colormap when OpenCV is available).
+
+    Notes:
+    - image_rgb: uint8 HxWx3
+    - heatmap: float HxW
+    """
+    try:
+        import cv2  # Local import to avoid hard dependency at import time.
+        hm_u8 = _normalize_heatmap_uint8(heatmap)
+        colored_bgr = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
+        colored_rgb = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
+        a = float(alpha)
+        a = 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
+        overlay = (a * colored_rgb.astype("float32") + (1.0 - a) * image_rgb.astype("float32")).clip(0, 255).astype("uint8")
+        return overlay
+    except Exception:
+        # Fallback: grayscale heatmap stacked to RGB.
+        hm_u8 = _normalize_heatmap_uint8(heatmap)
+        return np.stack([hm_u8, hm_u8, hm_u8], axis=-1)
+
+def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"]):
+    """Optionally concatenate the policy input and heatmap overlay side-by-side."""
+    if not getattr(cfg, "defense_viz", False):
+        return image_rgb
+    if heatmap is None:
+        return image_rgb
+    overlay = _make_overlay_rgb(image_rgb, heatmap, alpha=getattr(cfg, "defense_viz_alpha", 0.45))
+    try:
+        return np.concatenate([image_rgb, overlay], axis=1)
+    except Exception:
+        return image_rgb
 
 
 # @dataclass
@@ -117,8 +192,8 @@ from experiments.robot.robot_utils import (
 # os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 # @draccus.wrap()
 def eval_libero(cfg) -> None:
-    # Set CUDA device before loading model
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.cudaid)
+    # Note: CUDA_VISIBLE_DEVICES is now set in if __name__ == "__main__" before this function is called
+    # This ensures each process can independently use different GPUs
     
     # Update DEVICE in openvla_utils module
     from experiments.robot import openvla_utils
@@ -168,6 +243,27 @@ def eval_libero(cfg) -> None:
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
 
+    defense_hook = None
+    defense_detector = None
+    defense_purifier = None
+    if getattr(cfg, "defense_enabled", False):
+        defense_hook = OnlineAttentionHook(
+            model=model,
+            attn_module_name=getattr(cfg, "defense_attn_module", None),
+            aggregate_mode=getattr(cfg, "defense_aggregate_mode", "mean"),
+            image_size=get_image_resize_size(cfg),
+        )
+        defense_detector = PatchAttentionAnomalyDetector(
+            patch_mass_threshold=getattr(cfg, "defense_patch_mass_threshold", 0.25),
+            entropy_threshold=getattr(cfg, "defense_entropy_threshold", None),
+            use_entropy_gate=getattr(cfg, "defense_use_entropy_gate", False),
+        )
+        defense_purifier = ImagePurifier(
+            strategy=getattr(cfg, "defense_purifier_strategy", "mask_mean"),
+            pad=getattr(cfg, "defense_purifier_pad", 0),
+            gray_value=getattr(cfg, "defense_gray_value", 127),
+        )
+
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}"
     if cfg.run_id_note is not None:
@@ -198,6 +294,13 @@ def eval_libero(cfg) -> None:
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+        if getattr(cfg, "single_task_id", None) is not None and task_id != int(cfg.single_task_id):
+            continue
+
+        task_defense_triggers = 0
+        task_defense_patch_mass_sum = 0.0
+        task_defense_steps_checked = 0
+
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -206,6 +309,15 @@ def eval_libero(cfg) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+        _defense_debug_print(
+            cfg,
+            f"[DEFENSE][TASK_START] task_id={task_id} task='{task_description.strip()}' "
+            f"enabled={getattr(cfg, 'defense_enabled', False)} "
+            f"patch_xy=({int(cfg.x)},{int(cfg.y)}) angle={float(cfg.angle)} shx={float(cfg.shx)} shy={float(cfg.shy)} "
+            f"purifier={getattr(cfg, 'defense_purifier_strategy', 'NA')} "
+            f"th_patch_mass={getattr(cfg, 'defense_patch_mass_threshold', 'NA')}",
+            log_file=log_file,
+        )
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -234,6 +346,7 @@ def eval_libero(cfg) -> None:
                 max_steps = 373  # longest training demo has 373 steps
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
+            episode_defense_triggers = 0
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -250,26 +363,64 @@ def eval_libero(cfg) -> None:
                             img, patch, geometry=True, colorjitter=False,
                             angle=cfg.angle, shx=cfg.shx, shy=cfg.shy, position=(cfg.x, cfg.y)
                         )
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    img_for_policy = img
 
                     # Prepare observations dict
                     # Note: OpenVLA does not take proprio state as input
                     observation = {
-                        "full_image": img,
+                        "full_image": img_for_policy,
                         "state": np.concatenate(
                             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                         ),
                     }
 
-                    # Query model to get action
-                    action = get_action(
-                        cfg,
-                        model,
-                        observation,
-                        task_description,
-                        processor=processor,
-                    )
+                    # Query model to get action (this forward pass is also used to populate attention hooks)
+                    if defense_hook is not None:
+                        defense_hook.clear()
+                    action = get_action(cfg, model, observation, task_description, processor=processor)
+
+                    heatmap_for_viz = None
+                    if defense_hook is not None and defense_detector is not None and defense_purifier is not None:
+                        heatmap = defense_hook.get_heatmap()
+                        heatmap_for_viz = heatmap
+                        patch_box = PatchBox(
+                            x0=int(cfg.x),
+                            y0=int(cfg.y),
+                            x1=int(cfg.x) + int(getattr(cfg, "defense_patch_w", 50)),
+                            y1=int(cfg.y) + int(getattr(cfg, "defense_patch_h", 50)),
+                        )
+                        decision = defense_detector.detect(heatmap=heatmap, patch_box=patch_box)
+                        task_defense_steps_checked += 1
+                        task_defense_patch_mass_sum += float(decision.patch_mass)
+                        if _defense_debug_every_step(cfg):
+                            _defense_debug_print(
+                                cfg,
+                                f"[DEFENSE][CHECK] step={t} patch_mass={decision.patch_mass:.4f} "
+                                f"entropy={decision.entropy if decision.entropy is not None else 'NA'} "
+                                f"threshold={getattr(cfg, 'defense_patch_mass_threshold', 'NA')}",
+                                log_file=log_file,
+                            )
+                        if decision.is_anomaly:
+                            task_defense_triggers += 1
+                            episode_defense_triggers += 1
+                            img_for_policy = defense_purifier.purify(img_for_policy, patch_box=patch_box)
+                            # Recompute action on purified image (only when defense triggers).
+                            observation["full_image"] = img_for_policy
+                            if getattr(cfg, "defense_recompute_action", True):
+                                defense_hook.clear()
+                                action = get_action(cfg, model, observation, task_description, processor=processor)
+                            _defense_debug_print(
+                                cfg,
+                                f"[DEFENSE][TRIGGER] step={t} patch_mass={decision.patch_mass:.4f} "
+                                f"entropy={decision.entropy if decision.entropy is not None else 'NA'} "
+                                f"strategy={defense_purifier.strategy} recompute={getattr(cfg, 'defense_recompute_action', True)}",
+                                log_file=log_file,
+                            )
+
+                    # Save replay frame:
+                    # - default: policy input image
+                    # - optional: side-by-side with real-time heatmap overlay
+                    replay_images.append(_maybe_pack_replay_frame(cfg, img_for_policy, heatmap_for_viz))
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -298,7 +449,18 @@ def eval_libero(cfg) -> None:
             # Save a replay video of the episode
             print(f"Saving replay video...")
             save_rollout_video(
-                replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file,exp_name=cfg.exp_name
+                replay_images,
+                total_episodes,
+                success=done,
+                task_description=task_description,
+                log_file=log_file,
+                exp_name=cfg.exp_name,
+                rollout_root_dir=getattr(cfg, "rollout_root_dir", "./rollouts"),
+            )
+            _defense_debug_print(
+                cfg,
+                f"[DEFENSE][EPISODE_END] episode={task_episodes+1} success={done} triggers={episode_defense_triggers}",
+                log_file=log_file,
             )
 
             # Log current results
@@ -316,6 +478,13 @@ def eval_libero(cfg) -> None:
         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
         log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
         log_file.flush()
+        avg_patch_mass = (task_defense_patch_mass_sum / task_defense_steps_checked) if task_defense_steps_checked > 0 else 0.0
+        _defense_debug_print(
+            cfg,
+            f"[DEFENSE][TASK_END] task_id={task_id} episodes={task_episodes} success_rate={float(task_successes) / float(task_episodes):.3f} "
+            f"steps_checked={task_defense_steps_checked} triggers={task_defense_triggers} avg_patch_mass={avg_patch_mass:.4f}",
+            log_file=log_file,
+        )
         if cfg.use_wandb:
             wandb.log(
                 {
@@ -374,12 +543,14 @@ def parse_args():
     parser.add_argument("--task_suite_name", type=str, default="libero_object", help="Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90")
     parser.add_argument("--num_steps_wait", type=int, default=10, help="Number of steps to wait for objects to stabilize in sim")
     parser.add_argument("--num_trials_per_task", type=int, default=100, help="Number of rollouts per task")
+    parser.add_argument("--single_task_id", type=int, default=None, help="If set, only evaluate a single task id (debug).")
 
     #################################################################################################################
     # Utils
     #################################################################################################################
     parser.add_argument("--run_id_note", type=str, default=f"test_libero_object", help="Extra note to add in run ID for logging")
     parser.add_argument("--local_log_dir", type=str, default="./experiments/logs", help="Local directory for eval logs")
+    parser.add_argument("--rollout_root_dir", type=str, default="./rollouts", help="Root directory for saving rollout videos.")
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Whether to also log results in Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="LIBERO_simulation_test", help="Name of W&B project to log to (use default!)")
     parser.add_argument("--wandb_entity", type=str, default="taowen_wang-rit", help="Name of entity to log under")
@@ -389,15 +560,40 @@ def parse_args():
     parser.add_argument("--patchroot", type=str, default="/spl_data/tw9146/openvla-main/run/white_patch_attack/a5083c2b-1186-4464-ab9f-1056211a2221/4000/patch.pt", help="")
     parser.add_argument("--x", type=int, default=2, help="")
     parser.add_argument("--y", type=int, default=2, help="")
-    parser.add_argument("--angle", type=float, default=2, help="")
-    parser.add_argument("--shx", type=float, default=2, help="")
-    parser.add_argument("--shy", type=float, default=2, help="")
+    parser.add_argument("--angle", type=float, default=0, help="")
+    parser.add_argument("--shx", type=float, default=0, help="")
+    parser.add_argument("--shy", type=float, default=0, help="")
     parser.add_argument("--cudaid", type=int, default=2, help="")
+
+    # Defense control (online, debug stage)
+    parser.add_argument("--defense_enabled", type=str2bool, default=False, help="Enable online attention-based defense.")
+    parser.add_argument("--defense_attn_module", type=str, default=None, help="Optional attention module name to hook.")
+    parser.add_argument("--defense_aggregate_mode", type=str, default="mean", help="Attention head aggregation mode.")
+    parser.add_argument("--defense_patch_mass_threshold", type=float, default=0.25, help="Patch attention mass threshold.")
+    parser.add_argument("--defense_use_entropy_gate", type=str2bool, default=False, help="Gate detection by entropy threshold.")
+    parser.add_argument("--defense_entropy_threshold", type=float, default=None, help="Entropy threshold when gating is enabled.")
+    parser.add_argument("--defense_patch_w", type=int, default=50, help="Patch width in pixels (debug assumes axis-aligned box).")
+    parser.add_argument("--defense_patch_h", type=int, default=50, help="Patch height in pixels (debug assumes axis-aligned box).")
+    parser.add_argument("--defense_purifier_strategy", type=str, default="mask_mean", help="Purifier strategy: mask_mean|mask_gray.")
+    parser.add_argument("--defense_purifier_pad", type=int, default=0, help="Pad patch box before purification (pixels).")
+    parser.add_argument("--defense_gray_value", type=int, default=127, help="Gray value when using mask_gray purifier.")
+    parser.add_argument("--defense_recompute_action", type=str2bool, default=True, help="Recompute action using purified image when defense triggers.")
+    parser.add_argument("--defense_debug", type=str2bool, default=False, help="Print defense debug logs to terminal and log file.")
+    parser.add_argument("--defense_debug_every_step", type=str2bool, default=False, help="When enabled, print defense scores for every step (debug only).")
+    parser.add_argument("--defense_viz", type=str2bool, default=False, help="If enabled, save side-by-side frames (policy input | heatmap overlay).")
+    parser.add_argument("--defense_viz_alpha", type=float, default=0.45, help="Overlay alpha for heatmap visualization (0-1).")
 
     args = parser.parse_args()
     return args
 
 if __name__ == "__main__":
     args = parse_args()
-    # os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cudaid)
+    # CUDA_VISIBLE_DEVICES is already set at the top of the file (before torch import)
+    # This ensures each process can independently use different GPUs when running multiple terminals
+    # Double-check that it matches the parsed argument
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != str(args.cudaid):
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cudaid)
+        print(f"[*] Updated CUDA_VISIBLE_DEVICES={args.cudaid}")
+    else:
+        print(f"[*] CUDA_VISIBLE_DEVICES={args.cudaid} (already set correctly)")
     eval_libero(args)
