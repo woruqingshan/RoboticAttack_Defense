@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable, Any
 
 import numpy as np
 import torch
@@ -73,7 +73,11 @@ def infer_vision_token_meta(model: torch.nn.Module) -> VisionTokenMeta:
                         patch_grid_hw = (dim, dim)
             special_token_count = _infer_register_token_count(featurizer)
 
-    return VisionTokenMeta(num_patches=num_patches, patch_grid_hw=patch_grid_hw, special_token_count=special_token_count)
+    return VisionTokenMeta(
+        num_patches=num_patches,
+        patch_grid_hw=patch_grid_hw,
+        special_token_count=special_token_count,
+    )
 
 
 def infer_default_attn_module_name(model: torch.nn.Module) -> str:
@@ -116,11 +120,12 @@ def infer_default_attn_module_name(model: torch.nn.Module) -> str:
 
 class OnlineAttentionHook:
     """
-    Register an attention hook on an existing OpenVLA model instance and expose heatmap extraction.
+    Register an attention hook on an existing OpenVLA model instance and expose heatmap/grid extraction.
 
     Important:
     - This class does NOT load a model. It must be attached to the model used for online inference.
     - Attention tensors are populated when the model runs forward (e.g., during vla.predict_action()).
+    - The script is expected to call `clear()` before each forward step; this also resets internal caches.
     """
 
     def __init__(
@@ -150,8 +155,40 @@ class OnlineAttentionHook:
         self.hooks = AttentionHookManager()
         self.hooks.register_attention(target_module, self.cache_key)
 
+        # Caches valid only for the latest forward step (cleared by clear()).
+        self._cached_grid_2d: Optional[torch.Tensor] = None  # [Hgrid,Wgrid] on CPU
+        self._cached_grid_hw: Optional[Tuple[int, int]] = None
+        self._cached_heatmap: Optional[np.ndarray] = None  # [image_size,image_size]
+
+    def _invalidate_cache(self) -> None:
+        """Clear only derived caches (grid, heatmap); keep captured attention tensor."""
+        self._cached_grid_2d = None
+        self._cached_grid_hw = None
+        self._cached_heatmap = None
+
     def clear(self) -> None:
+        """Clear hook buffers and derived caches."""
         self.hooks.clear()
+        self._invalidate_cache()
+
+    def invalidate_cache(self) -> None:
+        """Clear only derived caches; keep captured attention tensor."""
+        self._invalidate_cache()
+
+    def run_and_capture(self, forward_fn: Callable[[], Any]) -> Any:
+        """
+        Helper for counterfactual / verification:
+        - clear hook buffers and derived caches
+        - run a forward pass (caller provides forward_fn)
+        - return forward_fn output
+
+        Usage:
+            hook.run_and_capture(lambda: get_action(...))
+            grid = hook.get_saliency_grid()
+            hm = hook.get_heatmap()
+        """
+        self.clear()
+        return forward_fn()
 
     def get_attention_tensor(self) -> torch.Tensor:
         attn = self.hooks.get(self.cache_key)
@@ -159,8 +196,10 @@ class OnlineAttentionHook:
             raise RuntimeError("Attention tensor was not captured. Check hook module selection.")
         return attn
 
-    def get_heatmap(self) -> np.ndarray:
-        """Convert the latest cached attention tensor to a 2D heatmap resized to image_size x image_size."""
+    def _compute_grid_2d(self) -> torch.Tensor:
+        """Compute and cache CLS->patch attention grid for the latest forward step."""
+        if self._cached_grid_2d is not None:
+            return self._cached_grid_2d
 
         attn_tensor = self.get_attention_tensor().to(torch.float32)
         aggregated = aggregate_attention_heads(attn_tensor, mode=self.aggregate_mode)
@@ -172,15 +211,98 @@ class OnlineAttentionHook:
             special_token_count=self.meta.special_token_count,
         )
 
-        grid, _grid_shape = attention_vector_to_grid(
+        grid_bhw, grid_shape = attention_vector_to_grid(
             cls_vec,
             patch_token_count=self.meta.num_patches,
             grid_shape=self.meta.patch_grid_hw,
         )
 
-        grid = grid[0].unsqueeze(0).unsqueeze(0)
-        up = F.interpolate(grid, size=(self.image_size, self.image_size), mode="bicubic", align_corners=False)
+        # grid_bhw: [B,Hgrid,Wgrid], online inference expects B==1.
+        grid_2d = grid_bhw[0].detach().to("cpu")
+        self._cached_grid_2d = grid_2d
+
+        if grid_shape is not None:
+            self._cached_grid_hw = (int(grid_shape[0]), int(grid_shape[1]))
+            if self.meta.patch_grid_hw is None:
+                self.meta.patch_grid_hw = self._cached_grid_hw
+        else:
+            self._cached_grid_hw = (int(grid_2d.shape[0]), int(grid_2d.shape[1]))
+            if self.meta.patch_grid_hw is None:
+                self.meta.patch_grid_hw = self._cached_grid_hw
+
+        return self._cached_grid_2d
+
+    def get_saliency_grid(self, force: bool = False) -> np.ndarray:
+        """Return low-res CLS->patch attention grid as numpy (e.g., 16x16).
+        
+        Args:
+            force: If True, invalidate cache and recompute from attention tensor.
+        """
+        if force:
+            self._invalidate_cache()
+        grid_2d = self._compute_grid_2d()
+        g = grid_2d.detach().cpu().numpy().astype(np.float32, copy=False)
+        # defensive: ensure non-negative (should already hold for attention, but keep robust)
+        g = g - float(g.min())
+        return g
+
+    def get_grid_shape(self) -> Tuple[int, int]:
+        """Return (Hgrid, Wgrid) for the saliency grid."""
+        if self._cached_grid_hw is not None:
+            return self._cached_grid_hw
+        if self.meta.patch_grid_hw is not None:
+            return self.meta.patch_grid_hw
+        g = self._compute_grid_2d()
+        return int(g.shape[0]), int(g.shape[1])
+
+    def grid_bbox_to_patch_box(self, gx0: int, gy0: int, gx1: int, gy1: int):
+        """Map grid bbox to pixel PatchBox in resized image coordinates [0, image_size]."""
+        # Local import prevents hard runtime dependency loops.
+        from .anomaly_detector import PatchBox  # type: ignore
+
+        hgrid, wgrid = self.get_grid_shape()
+
+        gx0 = int(np.clip(gx0, 0, wgrid))
+        gx1 = int(np.clip(gx1, 0, wgrid))
+        gy0 = int(np.clip(gy0, 0, hgrid))
+        gy1 = int(np.clip(gy1, 0, hgrid))
+        if gx1 < gx0:
+            gx0, gx1 = gx1, gx0
+        if gy1 < gy0:
+            gy0, gy1 = gy1, gy0
+
+        # Convert grid coords -> pixel coords (round reduces small-ROI bias).
+        x0 = int(round(gx0 * self.image_size / float(wgrid)))
+        x1 = int(round(gx1 * self.image_size / float(wgrid)))
+        y0 = int(round(gy0 * self.image_size / float(hgrid)))
+        y1 = int(round(gy1 * self.image_size / float(hgrid)))
+
+        x0 = int(np.clip(x0, 0, self.image_size))
+        x1 = int(np.clip(x1, 0, self.image_size))
+        y0 = int(np.clip(y0, 0, self.image_size))
+        y1 = int(np.clip(y1, 0, self.image_size))
+
+        return PatchBox(x0=x0, y0=y0, x1=x1, y1=y1)
+
+    def get_heatmap(self, force: bool = False) -> np.ndarray:
+        """Return upsampled heatmap (image_size x image_size) for visualization/legacy detector.
+        
+        Args:
+            force: If True, invalidate cache and recompute from attention tensor.
+        """
+        if force:
+            self._invalidate_cache()
+        if self._cached_heatmap is not None:
+            return self._cached_heatmap
+
+        grid_2d = self._compute_grid_2d()
+        grid = grid_2d.unsqueeze(0).unsqueeze(0)  # [1,1,Hgrid,Wgrid]
+        up = F.interpolate(
+            grid,
+            size=(self.image_size, self.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
         heatmap = up.squeeze().detach().cpu().numpy()
+        self._cached_heatmap = heatmap
         return heatmap
-
-

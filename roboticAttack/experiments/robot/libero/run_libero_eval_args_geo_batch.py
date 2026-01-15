@@ -97,6 +97,11 @@ from evaluation_tool.defense import (
     OnlineAttentionHook,
     PatchAttentionAnomalyDetector,
     PatchBox,
+    # Unified interface and auto-mode components
+    UnifiedDefenseInterface,
+    PatchAttentionLocalizer,
+    TemporalGate,
+    OnlinePatchDefenseController,
 )
 
 def _defense_debug_print(cfg, msg: str, log_file=None) -> None:
@@ -243,26 +248,77 @@ def eval_libero(cfg) -> None:
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
 
-    defense_hook = None
-    defense_detector = None
-    defense_purifier = None
+    defense_interface = None  # Unified defense interface
+    defense_purifier = None  # Keep for direct access if needed
     if getattr(cfg, "defense_enabled", False):
+        # Create hook (required for both modes)
         defense_hook = OnlineAttentionHook(
             model=model,
             attn_module_name=getattr(cfg, "defense_attn_module", None),
             aggregate_mode=getattr(cfg, "defense_aggregate_mode", "mean"),
             image_size=get_image_resize_size(cfg),
         )
-        defense_detector = PatchAttentionAnomalyDetector(
-            patch_mass_threshold=getattr(cfg, "defense_patch_mass_threshold", 0.25),
-            entropy_threshold=getattr(cfg, "defense_entropy_threshold", None),
-            use_entropy_gate=getattr(cfg, "defense_use_entropy_gate", False),
-        )
+        
+        # Create purifier (required for both modes)
         defense_purifier = ImagePurifier(
             strategy=getattr(cfg, "defense_purifier_strategy", "mask_mean"),
             pad=getattr(cfg, "defense_purifier_pad", 0),
             gray_value=getattr(cfg, "defense_gray_value", 127),
+            alpha=getattr(cfg, "defense_purifier_alpha", 0.8),
         )
+        
+        # Create unified interface based on mode
+        defense_mode = getattr(cfg, "defense_mode", "known")  # Default: backward compatible
+        
+        if defense_mode == "known":
+            # Known location mode (backward compatible)
+            defense_detector = PatchAttentionAnomalyDetector(
+                patch_mass_threshold=getattr(cfg, "defense_patch_mass_threshold", 0.25),
+                entropy_threshold=getattr(cfg, "defense_entropy_threshold", None),
+                use_entropy_gate=getattr(cfg, "defense_use_entropy_gate", False),
+            )
+            defense_interface = UnifiedDefenseInterface(
+                hook=defense_hook,
+                mode="known",
+                detector=defense_detector,
+                patch_x=int(cfg.x),
+                patch_y=int(cfg.y),
+                patch_w=int(getattr(cfg, "defense_patch_w", 50)),
+                patch_h=int(getattr(cfg, "defense_patch_h", 50)),
+                use_heatmap_for_viz=getattr(cfg, "defense_viz", False),
+            )
+        
+        elif defense_mode == "auto":
+            # Auto localization mode (new feature)
+            localizer = PatchAttentionLocalizer(
+                top_p=getattr(cfg, "defense_localizer_top_p", 0.07),
+                min_area_frac=getattr(cfg, "defense_localizer_min_area", 0.003),
+                max_area_frac=getattr(cfg, "defense_localizer_max_area", 0.12),
+            )
+            gate = TemporalGate(
+                theta_on=getattr(cfg, "defense_gate_theta_on", 0.07),
+                theta_off=getattr(cfg, "defense_gate_theta_off", 0.05),
+                ema_alpha=getattr(cfg, "defense_gate_ema_alpha", 0.3),
+                hold_frames=getattr(cfg, "defense_gate_hold_frames", 5),
+                cooldown_frames=getattr(cfg, "defense_gate_cooldown_frames", 3),
+            )
+            controller = OnlinePatchDefenseController(
+                hook=defense_hook,
+                localizer=localizer,
+                gate=gate,
+                motion_threshold_cells=getattr(cfg, "defense_controller_motion_threshold", 1.2),
+                motion_penalty_weight=getattr(cfg, "defense_controller_motion_penalty_weight", 0.3),
+                tracker_iou_keep=getattr(cfg, "defense_controller_tracker_iou_keep", 0.30),
+                tracker_ema=getattr(cfg, "defense_controller_tracker_ema", 0.50),
+                top_k_candidates=getattr(cfg, "defense_top_k_candidates", 3),
+                # Backward compatibility: deprecated parameters are ignored by new controller
+            )
+            defense_interface = UnifiedDefenseInterface(
+                hook=defense_hook,
+                mode="auto",
+                controller=controller,
+                use_heatmap_for_viz=getattr(cfg, "defense_viz", False),
+            )
 
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}"
@@ -327,6 +383,18 @@ def eval_libero(cfg) -> None:
 
             # Reset environment
             env.reset()
+            
+            # Reset defense stateful components for new episode
+            if defense_interface is not None:
+                try:
+                    defense_interface.reset()
+                except Exception as reset_error:
+                    error_msg = f"FATAL DEFENSE RESET ERROR: {reset_error}"
+                    print(error_msg)
+                    print("Exiting immediately to prevent empty episode analysis...")
+                    log_file.write(error_msg + "\n")
+                    log_file.close()
+                    sys.exit(1)
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx]) #
@@ -375,45 +443,88 @@ def eval_libero(cfg) -> None:
                     }
 
                     # Query model to get action (this forward pass is also used to populate attention hooks)
-                    if defense_hook is not None:
-                        defense_hook.clear()
+                    if defense_interface is not None:
+                        try:
+                            defense_interface.clear()
+                        except Exception as clear_error:
+                            error_msg = f"FATAL DEFENSE CLEAR ERROR: {clear_error}"
+                            print(error_msg)
+                            print("Exiting immediately to prevent empty episode analysis...")
+                            log_file.write(error_msg + "\n")
+                            log_file.close()
+                            sys.exit(1)
                     action = get_action(cfg, model, observation, task_description, processor=processor)
 
+                    # Unified defense step (works for both known and auto modes)
                     heatmap_for_viz = None
-                    if defense_hook is not None and defense_detector is not None and defense_purifier is not None:
-                        heatmap = defense_hook.get_heatmap()
-                        heatmap_for_viz = heatmap
-                        patch_box = PatchBox(
-                            x0=int(cfg.x),
-                            y0=int(cfg.y),
-                            x1=int(cfg.x) + int(getattr(cfg, "defense_patch_w", 50)),
-                            y1=int(cfg.y) + int(getattr(cfg, "defense_patch_h", 50)),
-                        )
-                        decision = defense_detector.detect(heatmap=heatmap, patch_box=patch_box)
+                    if defense_interface is not None:
+                        try:
+                            # For auto mode, pass additional parameters
+                            if defense_mode == "auto":
+                                defense_result = defense_interface.step(
+                                    image=img,
+                                    purify_fn=lambda img, box: defense_purifier.purify(img, box),
+                                    forward_fn=lambda img: get_action(cfg, model, {
+                                        "full_image": img,
+                                        "state": np.concatenate(
+                                            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+                                        ),
+                                    }, task_description, processor=processor),
+                                    heatmap_fn=lambda: defense_hook.get_heatmap(),
+                                )
+                            else:
+                                defense_result = defense_interface.step()
+                        except Exception as defense_error:
+                            # Exit immediately on defense errors to avoid empty episode analysis
+                            error_msg = f"FATAL DEFENSE ERROR: {defense_error}"
+                            print(error_msg)
+                            print("Exiting immediately to prevent empty episode analysis...")
+                            log_file.write(error_msg + "\n")
+                            log_file.close()
+                            sys.exit(1)
+                        
+                        # Get heatmap for visualization
+                        if getattr(cfg, "defense_viz", False):
+                            heatmap_for_viz = defense_result.heatmap
+                        
+                        # Statistics (backward compatible)
                         task_defense_steps_checked += 1
-                        task_defense_patch_mass_sum += float(decision.patch_mass)
+                        task_defense_patch_mass_sum += float(defense_result.patch_mass)
+                        
+                        # Debug output (backward compatible)
                         if _defense_debug_every_step(cfg):
                             _defense_debug_print(
                                 cfg,
-                                f"[DEFENSE][CHECK] step={t} patch_mass={decision.patch_mass:.4f} "
-                                f"entropy={decision.entropy if decision.entropy is not None else 'NA'} "
-                                f"threshold={getattr(cfg, 'defense_patch_mass_threshold', 'NA')}",
+                                f"[DEFENSE][CHECK] step={t} patch_mass={defense_result.patch_mass:.4f} "
+                                f"entropy={defense_result.entropy if defense_result.entropy is not None else 'NA'} "
+                                f"state={defense_result.state} reason={defense_result.reason}",
                                 log_file=log_file,
                             )
-                        if decision.is_anomaly:
+                        
+                        # Check if purification is needed (unified field)
+                        if defense_result.should_purify and defense_result.roi_box is not None:
                             task_defense_triggers += 1
                             episode_defense_triggers += 1
-                            img_for_policy = defense_purifier.purify(img_for_policy, patch_box=patch_box)
-                            # Recompute action on purified image (only when defense triggers).
+                            
+                            # Purify image (unified interface)
+                            # Use strength from defense_result if available (auto mode provides dynamic strength)
+                            img_for_policy = defense_purifier.purify(
+                                img_for_policy,
+                                defense_result.roi_box,
+                                strength=getattr(defense_result, "strength", None)  # Use dynamic strength if available
+                            )
+                            
+                            # Recompute action on purified image
                             observation["full_image"] = img_for_policy
                             if getattr(cfg, "defense_recompute_action", True):
-                                defense_hook.clear()
+                                defense_interface.clear()
                                 action = get_action(cfg, model, observation, task_description, processor=processor)
+                            
                             _defense_debug_print(
                                 cfg,
-                                f"[DEFENSE][TRIGGER] step={t} patch_mass={decision.patch_mass:.4f} "
-                                f"entropy={decision.entropy if decision.entropy is not None else 'NA'} "
-                                f"strategy={defense_purifier.strategy} recompute={getattr(cfg, 'defense_recompute_action', True)}",
+                                f"[DEFENSE][TRIGGER] step={t} patch_mass={defense_result.patch_mass:.4f} "
+                                f"state={defense_result.state} strategy={defense_purifier.strategy} "
+                                f"recompute={getattr(cfg, 'defense_recompute_action', True)}",
                                 log_file=log_file,
                             )
 
@@ -567,16 +678,41 @@ def parse_args():
 
     # Defense control (online, debug stage)
     parser.add_argument("--defense_enabled", type=str2bool, default=False, help="Enable online attention-based defense.")
+    parser.add_argument("--defense_mode", type=str, default="known", choices=["known", "auto"],
+                        help="Defense mode: 'known' (oracle patch location) or 'auto' (localize from heatmap).")
     parser.add_argument("--defense_attn_module", type=str, default=None, help="Optional attention module name to hook.")
     parser.add_argument("--defense_aggregate_mode", type=str, default="mean", help="Attention head aggregation mode.")
-    parser.add_argument("--defense_patch_mass_threshold", type=float, default=0.25, help="Patch attention mass threshold.")
-    parser.add_argument("--defense_use_entropy_gate", type=str2bool, default=False, help="Gate detection by entropy threshold.")
-    parser.add_argument("--defense_entropy_threshold", type=float, default=None, help="Entropy threshold when gating is enabled.")
-    parser.add_argument("--defense_patch_w", type=int, default=50, help="Patch width in pixels (debug assumes axis-aligned box).")
-    parser.add_argument("--defense_patch_h", type=int, default=50, help="Patch height in pixels (debug assumes axis-aligned box).")
-    parser.add_argument("--defense_purifier_strategy", type=str, default="mask_mean", help="Purifier strategy: mask_mean|mask_gray.")
+    # Known mode parameters
+    parser.add_argument("--defense_patch_mass_threshold", type=float, default=0.25, help="Patch attention mass threshold (known mode).")
+    parser.add_argument("--defense_use_entropy_gate", type=str2bool, default=False, help="Gate detection by entropy threshold (known mode).")
+    parser.add_argument("--defense_entropy_threshold", type=float, default=None, help="Entropy threshold when gating is enabled (known mode).")
+    parser.add_argument("--defense_patch_w", type=int, default=50, help="Patch width in pixels (known mode, axis-aligned box).")
+    parser.add_argument("--defense_patch_h", type=int, default=50, help="Patch height in pixels (known mode, axis-aligned box).")
+    # Auto mode parameters
+    parser.add_argument("--defense_localizer_top_p", type=float, default=0.07, help="Top-p fraction for saliency thresholding (auto mode).")
+    parser.add_argument("--defense_localizer_min_area", type=float, default=0.003, help="Minimum area ratio for candidate ROI (auto mode).")
+    parser.add_argument("--defense_localizer_max_area", type=float, default=0.12, help="Maximum area ratio for candidate ROI (auto mode).")
+    parser.add_argument("--defense_gate_theta_on", type=float, default=0.07, help="Threshold to trigger masking (auto mode, hysteresis on).")
+    parser.add_argument("--defense_gate_theta_off", type=float, default=0.05, help="Threshold to stop masking (auto mode, hysteresis off).")
+    parser.add_argument("--defense_gate_ema_alpha", type=float, default=0.3, help="EMA smoothing coefficient for mass (auto mode).")
+    parser.add_argument("--defense_gate_hold_frames", type=int, default=5, help="Minimum frames to hold masking state (auto mode).")
+    parser.add_argument("--defense_gate_cooldown_frames", type=int, default=3, help="Cooldown frames after masking (auto mode).")
+    parser.add_argument("--defense_controller_motion_threshold", type=float, default=1.2, help="Max centroid movement (grid cells) to be considered static (auto mode).")
+    parser.add_argument("--defense_controller_motion_penalty_weight", type=float, default=0.3, help="Motion penalty weight for candidate scoring (auto mode).")
+    parser.add_argument("--defense_controller_tracker_iou_keep", type=float, default=0.30, help="IoU threshold for ROI tracking stickiness (auto mode).")
+    parser.add_argument("--defense_controller_tracker_ema", type=float, default=0.50, help="EMA alpha for ROI position smoothing (auto mode).")
+    parser.add_argument("--defense_top_k_candidates", type=int, default=3, help="Number of top candidates to evaluate (auto mode).")
+    # Deprecated parameters (kept for backward compatibility)
+    parser.add_argument("--defense_controller_min_stable_frames", type=int, default=3, help="[DEPRECATED] Require this many consecutive static frames before trigger (auto mode).")
+    parser.add_argument("--defense_controller_track_iou", type=float, default=0.2, help="[DEPRECATED] IoU threshold for ROI tracking stickiness (auto mode).")
+    parser.add_argument("--defense_controller_max_jump", type=float, default=3.0, help="[DEPRECATED] Max jump distance (grid cells) to accept new ROI (auto mode).")
+    # Purifier parameters
+    parser.add_argument("--defense_purifier_strategy", type=str, default="mask_mean",
+                        choices=["mask_mean", "mask_gray", "blend_mean", "blend_gray", "blur"],
+                        help="Purifier strategy: mask_mean|mask_gray|blend_mean|blend_gray|blur.")
     parser.add_argument("--defense_purifier_pad", type=int, default=0, help="Pad patch box before purification (pixels).")
-    parser.add_argument("--defense_gray_value", type=int, default=127, help="Gray value when using mask_gray purifier.")
+    parser.add_argument("--defense_purifier_alpha", type=float, default=0.8, help="Blend strength for blend_* strategies (0-1).")
+    parser.add_argument("--defense_gray_value", type=int, default=127, help="Gray value when using mask_gray/blend_gray purifier.")
     parser.add_argument("--defense_recompute_action", type=str2bool, default=True, help="Recompute action using purified image when defense triggers.")
     parser.add_argument("--defense_debug", type=str2bool, default=False, help="Print defense debug logs to terminal and log file.")
     parser.add_argument("--defense_debug_every_step", type=str2bool, default=False, help="When enabled, print defense scores for every step (debug only).")
