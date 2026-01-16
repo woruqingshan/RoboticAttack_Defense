@@ -8,7 +8,6 @@ from .anomaly_detector import (
     PatchAttentionAnomalyDetector,
     # Auto-mode components
     GridBox,
-    LocalizationResult,
     PatchAttentionLocalizer,
     TemporalGate,
     TemporalGateState,
@@ -53,7 +52,6 @@ __all__ = [
     "PatchBox",
     # Auto-mode localization + temporal control
     "GridBox",
-    "LocalizationResult",
     "PatchAttentionLocalizer",
     "TemporalGate",
     "TemporalGateState",

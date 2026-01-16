@@ -102,6 +102,7 @@ from evaluation_tool.defense import (
     PatchAttentionLocalizer,
     TemporalGate,
     OnlinePatchDefenseController,
+    CounterfactualVerifier,
 )
 
 def _defense_debug_print(cfg, msg: str, log_file=None) -> None:
@@ -302,6 +303,20 @@ def eval_libero(cfg) -> None:
                 hold_frames=getattr(cfg, "defense_gate_hold_frames", 5),
                 cooldown_frames=getattr(cfg, "defense_gate_cooldown_frames", 3),
             )
+            
+            # Create verifier if enabled
+            verifier = None
+            if getattr(cfg, "defense_verifier_enabled", True):  # Default: enabled
+                verifier = CounterfactualVerifier(
+                    min_mass_drop_rel=getattr(cfg, "defense_verifier_min_mass_drop", 0.15),
+                    min_entropy_gain_abs=getattr(cfg, "defense_verifier_min_entropy_gain", 0.02),
+                    max_main_mass_drop_rel=getattr(cfg, "defense_verifier_max_main_drop", 0.10),
+                    min_action_diff_l2=getattr(cfg, "defense_verifier_min_action_diff_l2", 0.01),
+                    min_action_diff_rel=getattr(cfg, "defense_verifier_min_action_diff_rel", 0.05),
+                    min_gripper_diff=getattr(cfg, "defense_verifier_min_gripper_diff", 0.1),
+                    use_action_verification=getattr(cfg, "defense_verifier_use_action", True),
+                )
+            
             controller = OnlinePatchDefenseController(
                 hook=defense_hook,
                 localizer=localizer,
@@ -311,6 +326,10 @@ def eval_libero(cfg) -> None:
                 tracker_iou_keep=getattr(cfg, "defense_controller_tracker_iou_keep", 0.30),
                 tracker_ema=getattr(cfg, "defense_controller_tracker_ema", 0.50),
                 top_k_candidates=getattr(cfg, "defense_top_k_candidates", 3),
+                verifier=verifier,
+                verify_every_k=getattr(cfg, "defense_verifier_every_k", 1),  # Verify on every trigger edge
+                verify_block_frames=getattr(cfg, "defense_verifier_block_frames", 6),
+                require_verify=getattr(cfg, "defense_require_verify", False),  # Default: False (backward compatible)
                 # Backward compatibility: deprecated parameters are ignored by new controller
             )
             defense_interface = UnifiedDefenseInterface(
@@ -491,13 +510,25 @@ def eval_libero(cfg) -> None:
                         task_defense_steps_checked += 1
                         task_defense_patch_mass_sum += float(defense_result.patch_mass)
                         
-                        # Debug output (backward compatible)
+                        # Debug output (backward compatible + verifier details)
                         if _defense_debug_every_step(cfg):
+                            verifier_info = ""
+                            if defense_result.verify_stats is not None:
+                                vs = defense_result.verify_stats
+                                verifier_info = (
+                                    f" | VERIFY: verified={defense_result.verified} "
+                                    f"roi_mass_drop={vs.get('roi_mass_rel_drop', 0):.3f} "
+                                    f"entropy_gain={vs.get('entropy_gain', 0):.3f} "
+                                    f"main_mass_drop={vs.get('main_mass_drop', 0):.3f} "
+                                    f"action_diff_l2={vs.get('action_diff_l2', 0):.4f} "
+                                    f"action_diff_rel={vs.get('action_diff_rel', 0):.3f} "
+                                    f"gripper_diff={vs.get('gripper_diff', 0):.3f}"
+                                )
                             _defense_debug_print(
                                 cfg,
                                 f"[DEFENSE][CHECK] step={t} patch_mass={defense_result.patch_mass:.4f} "
                                 f"entropy={defense_result.entropy if defense_result.entropy is not None else 'NA'} "
-                                f"state={defense_result.state} reason={defense_result.reason}",
+                                f"state={defense_result.state} reason={defense_result.reason}{verifier_info}",
                                 log_file=log_file,
                             )
                         
@@ -520,11 +551,24 @@ def eval_libero(cfg) -> None:
                                 defense_interface.clear()
                                 action = get_action(cfg, model, observation, task_description, processor=processor)
                             
+                            # Enhanced trigger log with verifier details
+                            verifier_info = ""
+                            if defense_result.verify_stats is not None:
+                                vs = defense_result.verify_stats
+                                verifier_info = (
+                                    f" | VERIFY: verified={defense_result.verified} "
+                                    f"roi_mass_drop={vs.get('roi_mass_rel_drop', 0):.3f} "
+                                    f"entropy_gain={vs.get('entropy_gain', 0):.3f} "
+                                    f"main_mass_drop={vs.get('main_mass_drop', 0):.3f} "
+                                    f"action_diff_l2={vs.get('action_diff_l2', 0):.4f} "
+                                    f"action_diff_rel={vs.get('action_diff_rel', 0):.3f} "
+                                    f"gripper_diff={vs.get('gripper_diff', 0):.3f}"
+                                )
                             _defense_debug_print(
                                 cfg,
                                 f"[DEFENSE][TRIGGER] step={t} patch_mass={defense_result.patch_mass:.4f} "
                                 f"state={defense_result.state} strategy={defense_purifier.strategy} "
-                                f"recompute={getattr(cfg, 'defense_recompute_action', True)}",
+                                f"recompute={getattr(cfg, 'defense_recompute_action', True)}{verifier_info}",
                                 log_file=log_file,
                             )
 
@@ -718,6 +762,18 @@ def parse_args():
     parser.add_argument("--defense_debug_every_step", type=str2bool, default=False, help="When enabled, print defense scores for every step (debug only).")
     parser.add_argument("--defense_viz", type=str2bool, default=False, help="If enabled, save side-by-side frames (policy input | heatmap overlay).")
     parser.add_argument("--defense_viz_alpha", type=float, default=0.45, help="Overlay alpha for heatmap visualization (0-1).")
+    # Verifier parameters (counterfactual verification)
+    parser.add_argument("--defense_verifier_enabled", type=str2bool, default=True, help="Enable counterfactual verifier (auto mode only).")
+    parser.add_argument("--defense_verifier_min_mass_drop", type=float, default=0.15, help="Minimum relative ROI mass drop for verification (Tier 1).")
+    parser.add_argument("--defense_verifier_min_entropy_gain", type=float, default=0.02, help="Minimum absolute entropy gain for verification (Tier 1).")
+    parser.add_argument("--defense_verifier_max_main_drop", type=float, default=0.10, help="Maximum relative mainland mass drop (Tier 2: task preservation).")
+    parser.add_argument("--defense_verifier_min_action_diff_l2", type=float, default=0.01, help="Minimum L2 action difference for verification (Tier 3).")
+    parser.add_argument("--defense_verifier_min_action_diff_rel", type=float, default=0.05, help="Minimum relative action difference for verification (Tier 3).")
+    parser.add_argument("--defense_verifier_min_gripper_diff", type=float, default=0.1, help="Minimum gripper action difference for verification (Tier 3).")
+    parser.add_argument("--defense_verifier_use_action", type=str2bool, default=True, help="Enable action-level verification (Tier 3).")
+    parser.add_argument("--defense_verifier_every_k", type=int, default=1, help="Verify every k trigger edges (1 = verify on every trigger).")
+    parser.add_argument("--defense_verifier_block_frames", type=int, default=6, help="Block frames after verification failure.")
+    parser.add_argument("--defense_require_verify", type=str2bool, default=False, help="Require verification to pass before purifying (strict mode).")
 
     args = parser.parse_args()
     return args

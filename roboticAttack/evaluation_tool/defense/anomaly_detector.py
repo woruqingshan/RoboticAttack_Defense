@@ -26,8 +26,9 @@ import math
 import numpy as np
 
 # --- NEW: decoupled modules ---
-from .localizer import AttentionLocalizer
+from .localizer import TemporalPatchAttentionLocalizer, TemporalLocalizeResult
 from .temporal import (
+    GridBox,
     RunningStats2D,
     AttentionStabilityScorer,
     ROITracker,
@@ -136,108 +137,28 @@ class PatchAttentionAnomalyDetector:
 # Auto localization + smoothing control (NEW)
 # =========================
 
-@dataclass(frozen=True)
-class GridBox:
-    """Axis-aligned bbox in low-res saliency grid coordinates [0..W/H]."""
-    gx0: int
-    gy0: int
-    gx1: int
-    gy1: int
+def _pad_grid_box(box: GridBox, pad_cells: int, *, gw: int, gh: int) -> GridBox:
+    """Pad a GridBox by `pad_cells` and clamp to the grid shape.
 
-    def clamp(self, gw: int, gh: int) -> "GridBox":
-        gx0 = int(max(0, min(self.gx0, gw)))
-        gx1 = int(max(0, min(self.gx1, gw)))
-        gy0 = int(max(0, min(self.gy0, gh)))
-        gy1 = int(max(0, min(self.gy1, gh)))
-        if gx1 < gx0:
-            gx0, gx1 = gx1, gx0
-        if gy1 < gy0:
-            gy0, gy1 = gy1, gy0
-        return GridBox(gx0=gx0, gy0=gy0, gx1=gx1, gy1=gy1)
-
-    def area(self) -> int:
-        return int(max(0, self.gx1 - self.gx0) * max(0, self.gy1 - self.gy0))
-
-    def pad(self, p: int) -> "GridBox":
-        p = int(max(0, p))
-        return GridBox(self.gx0 - p, self.gy0 - p, self.gx1 + p, self.gy1 + p)
-
-    def centroid(self) -> Tuple[float, float]:
-        cx = (self.gx0 + self.gx1) * 0.5
-        cy = (self.gy0 + self.gy1) * 0.5
-        return float(cx), float(cy)
-
-    def iou(self, other: "GridBox") -> float:
-        ax0, ay0, ax1, ay1 = self.gx0, self.gy0, self.gx1, self.gy1
-        bx0, by0, bx1, by1 = other.gx0, other.gy0, other.gx1, other.gy1
-        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
-        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
-        iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
-        inter = iw * ih
-        union = self.area() + other.area() - inter
-        return float(inter / union) if union > 0 else 0.0
-
-
-@dataclass(frozen=True)
-class LocalizationResult:
-    """Per-frame localization result on the saliency grid."""
-    found: bool
-    grid_box: Optional[GridBox]
-    mass: float
-    area_frac: float
-    concentration: float
-    centroid: Optional[Tuple[float, float]]
-    reason: str = ""
-
-
-def _connected_components(mask: np.ndarray, connectivity: int = 4) -> List[List[Tuple[int, int]]]:
+    Note:
+        `temporal.GridBox` intentionally does not include `.pad()` to keep it minimal.
+        This helper is used to preserve the old behavior of expanding the ROI slightly.
     """
-    Very small-grid connected components (BFS), no external deps.
-    mask: bool HxW
-    returns: list of components, each a list of (y,x)
-    """
-    if mask.ndim != 2:
-        raise ValueError(f"mask must be 2D, got {mask.shape}")
-    h, w = mask.shape
-    visited = np.zeros_like(mask, dtype=bool)
-    comps: List[List[Tuple[int, int]]] = []
-
-    if connectivity == 8:
-        neigh = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
-    else:
-        neigh = [(-1,0),(1,0),(0,-1),(0,1)]
-
-    for y in range(h):
-        for x in range(w):
-            if not mask[y, x] or visited[y, x]:
-                continue
-            q: Deque[Tuple[int, int]] = deque()
-            q.append((y, x))
-            visited[y, x] = True
-            comp: List[Tuple[int, int]] = [(y, x)]
-            while q:
-                cy, cx = q.popleft()
-                for dy, dx in neigh:
-                    ny, nx = cy + dy, cx + dx
-                    if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and (not visited[ny, nx]):
-                        visited[ny, nx] = True
-                        q.append((ny, nx))
-                        comp.append((ny, nx))
-            comps.append(comp)
-    return comps
+    p = int(max(0, pad_cells))
+    b = GridBox(gx0=int(box.gx0) - p, gy0=int(box.gy0) - p, gx1=int(box.gx1) + p, gy1=int(box.gy1) + p)
+    return b.clamp(gw=int(gw), gh=int(gh))
 
 
 class PatchAttentionLocalizer:
     """
-    Wrapper over localizer.AttentionLocalizer.
-    Keeps the old name + return type (LocalizationResult) for compatibility.
+    Auto-mode localizer (v3): temporal mainland-vs-island localizer.
 
-    NOTE:
-    - `AttentionLocalizer` uses pure-numpy CC and returns roi box as (x0,y0,x1,y1).
-    - We convert it into your GridBox/LocalizationResult.
-    - Parameter mapping: min_area_frac/max_area_frac are passed directly to underlying localizer
-      (defaults may differ: 0.003/0.12 vs 0.01/0.25, but user can override).
-    - connectivity parameter is kept for compatibility but underlying impl always uses 4-neighborhood.
+    This keeps the old class name (`PatchAttentionLocalizer`) so existing scripts
+    (e.g., `run_libero_eval_args_geo_batch.py`) don't break, but it **no longer**
+    uses the legacy single-frame "small & dense" heuristic.
+
+    Internally it delegates to `localizer.TemporalPatchAttentionLocalizer` and returns
+    `TemporalLocalizeResult` (main_roi/outlier_roi/outlier_score/debug).
     """
 
     def __init__(
@@ -245,7 +166,7 @@ class PatchAttentionLocalizer:
         top_p: float = 0.07,
         min_area_frac: float = 0.003,
         max_area_frac: float = 0.12,
-        connectivity: int = 4,   # kept for compatibility; underlying impl uses 4-neigh
+        connectivity: int = 4,   # kept for compatibility (unused in v3)
         pad_cells: int = 1,
         eps: float = 1e-12,
     ) -> None:
@@ -256,44 +177,44 @@ class PatchAttentionLocalizer:
         self.pad_cells = int(pad_cells)
         self.eps = float(eps)
 
-        # decoupled localizer
-        self._impl = AttentionLocalizer(
+        # Temporal mainland-vs-island localizer (decoupled, pure numpy)
+        self._impl = TemporalPatchAttentionLocalizer(
             top_p=self.top_p,
-            min_area=self.min_area_frac,
-            max_area=self.max_area_frac,
+            min_area=float(self.min_area_frac),
+            max_area=float(self.max_area_frac),
+            eps=float(max(self.eps, 1e-8)),
         )
 
-    def localize(self, grid: np.ndarray, top_k: int = 1) -> List[LocalizationResult]:
-        if grid.ndim != 2:
-            raise ValueError(f"grid must be 2D, got shape={grid.shape}")
-        gh, gw = grid.shape
+    def reset(self) -> None:
+        self._impl.reset()
 
-        results = self._impl.localize(grid, top_k=top_k)
-        if not results:
-            return [LocalizationResult(False, None, 0.0, 0.0, 0.0, None, reason="no_roi")]
+    def localize(self, stable_grid: np.ndarray) -> TemporalLocalizeResult:
+        """Localize mainland ROI + outlier island ROI on a (stable) grid."""
+        if stable_grid.ndim != 2:
+            raise ValueError(f"stable_grid must be 2D, got shape={stable_grid.shape}")
+        gh, gw = int(stable_grid.shape[0]), int(stable_grid.shape[1])
 
-        localized_results = []
-        for res in results:
-            # GridBox is now a dataclass, access attributes instead of unpacking
-            x0, y0, x1, y1 = res.roi.gx0, res.roi.gy0, res.roi.gx1, res.roi.gy1
-            gb = GridBox(gx0=int(x0), gy0=int(y0), gx1=int(x1), gy1=int(y1))
-            gb = gb.pad(self.pad_cells).clamp(gw=gw, gh=gh)
+        r = self._impl.localize(stable_grid)
 
-            # compute concentration (mass / area_frac)
-            conc = float(res.roi_mass / (res.area_ratio + self.eps))
-            cx, cy = gb.centroid()
+        # Preserve old behavior: slightly pad the candidate outlier ROI (mask more context).
+        if r.outlier_roi is not None:
+            outlier = _pad_grid_box(r.outlier_roi, self.pad_cells, gw=gw, gh=gh)
+        else:
+            outlier = None
 
-            localized_results.append(LocalizationResult(
-                found=True,
-                grid_box=gb,
-                mass=float(res.roi_mass),
-                area_frac=float(res.area_ratio),
-                concentration=float(conc),
-                centroid=(float(cx), float(cy)),
-                reason=f"thr={res.threshold:.6f} mass={res.roi_mass:.3f} area={res.area_ratio:.3f}",
-            ))
-
-        return localized_results
+        # NOTE: we intentionally do not pad the mainland ROI; it is used for debugging
+        # and for future verifier/task-preservation checks.
+        # Create a new TemporalLocalizeResult with padded outlier_roi, preserving all other fields from r.
+        return TemporalLocalizeResult(
+            main_roi=r.main_roi,
+            outlier_roi=outlier,
+            outlier_score=float(r.outlier_score),
+            threshold=float(r.threshold),
+            chosen_label=r.chosen_label,
+            main_label=r.main_label,
+            reason=str(r.reason),
+            debug=dict(r.debug) if isinstance(r.debug, dict) else {},
+        )
 
 
 @dataclass(frozen=True)
@@ -357,6 +278,7 @@ class TemporalGate:
 @dataclass(frozen=True)
 class DefenseDecision:
     """Decision for one step (auto-mode)."""
+    # Required fields (no default values) - must come first
     should_purify: bool
     roi_box: Optional[PatchBox]
     grid_box: Optional[GridBox]
@@ -364,8 +286,14 @@ class DefenseDecision:
     raw_mass: float
     state: str
     reason: str
+    
+    # Optional fields (with default values) - must come after required fields
+    main_grid_box: Optional[GridBox] = None
+    outlier_score: float = 0.0
     # Optional: caller can use it as purifier strength (0..1). Not required.
     strength: Optional[float] = None
+    verified: Optional[bool] = None
+    verify_stats: Optional[dict] = None
 
 
 class OnlinePatchDefenseController:
@@ -401,6 +329,9 @@ class OnlinePatchDefenseController:
         verifier: Optional[CounterfactualVerifier] = None,
         verify_every_k: int = 3,          # only verify at low frequency
         verify_block_frames: int = 6,     # if verification fails, block purify for a few frames
+        # v3: reduce flicker and enforce counterfactual evidence
+        freeze_roi_in_hold: bool = True,
+        require_verify: bool = False,
     ) -> None:
         self.hook = hook
         self.localizer = localizer
@@ -427,6 +358,14 @@ class OnlinePatchDefenseController:
         self._verify_block_left = 0
         self._t = 0
 
+        # v3: freeze ROI during HOLD to reduce flicker
+        self.freeze_roi_in_hold = bool(freeze_roi_in_hold)
+        self.require_verify = bool(require_verify)
+        self._prev_gate_state: str = "SAFE"
+        self._frozen_outlier_grid: Optional[GridBox] = None
+        self._frozen_main_grid: Optional[GridBox] = None
+        self._frozen_outlier_score: float = 0.0
+
     def reset(self) -> None:
         self.gate.reset()
         self._stats = None
@@ -435,6 +374,13 @@ class OnlinePatchDefenseController:
         self._prev_image = None
         self._verify_block_left = 0
         self._t = 0
+        self._prev_gate_state = "SAFE"
+        self._frozen_outlier_grid = None
+        self._frozen_main_grid = None
+        self._frozen_outlier_score = 0.0
+        # Reset localizer temporal state for a new episode.
+        if hasattr(self.localizer, "reset"):
+            self.localizer.reset()
 
     def _mass_to_strength(self, mass_ema: float) -> float:
         """
@@ -521,144 +467,162 @@ class OnlinePatchDefenseController:
         st = self._stats.update(grid)
         stable_grid = st.stable  # long-term high + low variance
 
-        # --- (B) candidate localization on stable grid (Top-K) ---
-        candidates = self.localizer.localize(stable_grid, top_k=self.top_k_candidates)
+        # --- (B) temporal mainland-vs-island localization on stable grid (v3) ---
+        # Freeze ROI during HOLD to reduce flicker.
+        use_frozen = (
+            bool(self.freeze_roi_in_hold)
+            and (self._prev_gate_state == "HOLD")
+            and (self._frozen_outlier_grid is not None)
+        )
 
-        if not candidates:
-            should, mass_ema, state, greason = self.gate.step(0.0)
-            return DefenseDecision(
-                should_purify=False,
-                roi_box=None,
-                grid_box=None,
-                mass_ema=float(mass_ema),
-                raw_mass=0.0,
-                state=str(state),
-                reason=f"no_candidates | {greason}",
-                strength=None,
-            )
+        if use_frozen:
+            main_grid = self._frozen_main_grid
+            roi_grid = self._frozen_outlier_grid
+            raw_outlier_score = float(self._frozen_outlier_score)
+            loc_reason = "frozen_hold"
+            loc_debug: dict = {}
+        else:
+            tlr = self.localizer.localize(stable_grid)
+            main_grid = tlr.main_roi
+            roi_grid = tlr.outlier_roi
+            raw_outlier_score = float(tlr.outlier_score)
+            loc_reason = str(tlr.debug.get("reason", "")) if isinstance(tlr.debug, dict) else ""
+            if not loc_reason:
+                loc_reason = "ok"
+            loc_debug = dict(tlr.debug) if isinstance(tlr.debug, dict) else {}
 
-        # --- (B.1) Evaluate candidates with motion penalty ---
-        best_candidate = None
-        best_score = -1.0
-
-        for loc in candidates:
-            if not loc.found or loc.grid_box is None:
-                continue
-
-            # Base score from stable mass
-            base_score = float(self._scorer.score(stable_grid, loc.grid_box))
-
-            # Motion penalty
-            motion_energy = self._compute_motion_energy(image, loc.grid_box)
-            motion_penalty = self.motion_penalty_weight * motion_energy
-
-            # Combined score: favor high mass + low motion
-            combined_score = base_score * (1.0 - motion_penalty)
-
-            if combined_score > best_score:
-                best_score = combined_score
-                best_candidate = loc
-
-        if best_candidate is None:
-            should, mass_ema, state, greason = self.gate.step(0.0)
-            return DefenseDecision(
-                should_purify=False,
-                roi_box=None,
-                grid_box=None,
-                mass_ema=float(mass_ema),
-                raw_mass=0.0,
-                state=str(state),
-                reason=f"no_valid_candidate | {greason}",
-                strength=None,
-            )
-
-        loc = best_candidate
-
-        # --- (C) ROI track to reduce jitter ---
-        proposal = loc.grid_box  # GridBox object, not tuple
-        upd = self._tracker.update(proposal)
-        roi_grid = upd.roi
         if roi_grid is None:
             should, mass_ema, state, greason = self.gate.step(0.0)
+            self._prev_gate_state = str(state)
+            # Clear frozen ROI when we don't have a valid candidate.
+            self._frozen_outlier_grid = None
+            self._frozen_main_grid = None
+            self._frozen_outlier_score = 0.0
             return DefenseDecision(
                 should_purify=False,
                 roi_box=None,
                 grid_box=None,
+                main_grid_box=main_grid,
+                outlier_score=0.0,
                 mass_ema=float(mass_ema),
-                raw_mass=float(loc.mass),
+                raw_mass=0.0,
                 state=str(state),
-                reason=f"tracker_empty | {greason}",
+                reason=f"no_outlier_roi | {loc_reason} | {greason}",
                 strength=None,
+                verified=None,
+                verify_stats=None,
             )
 
-        # --- (D) score on stable grid (NOT on raw heatmap) ---
-        stable_mass = float(self._scorer.score(stable_grid, roi_grid))
-        # Calculate area penalty: penalize large ROIs (often gripper/object), favor compact patches
-        x0, y0, x1, y1 = roi_grid.gx0, roi_grid.gy0, roi_grid.gx1, roi_grid.gy1
-        roi_area = float(max(0, x1 - x0) * max(0, y1 - y0))
-        grid_area = float(stable_grid.size)
-        area_frac = float(roi_area / (grid_area + 1e-12))
-        # Penalize large ROIs (often gripper/object), keep score in [0, stable_mass]
-        # area_ref ~ (4x4)/256 for 16x16 grid, typical patch size
-        area_ref = 0.06
-        penalty = float(min(1.0, area_ref / (area_frac + 1e-12)))
-        score = float(stable_mass * penalty)
+        # Gate expects a bounded score (historically in [0,1]).
+        # We clamp the temporal localizer score to keep existing theta_on/off semantics usable.
+        score = float(np.clip(raw_outlier_score, 0.0, 1.0))
 
         # verification fail blocking (avoid repeated false masking)
         if self._verify_block_left > 0:
             self._verify_block_left -= 1
             should, mass_ema, state, greason = self.gate.step(0.0)
+            self._prev_gate_state = str(state)
             return DefenseDecision(
                 should_purify=False,
                 roi_box=None,
                 grid_box=None,
+                main_grid_box=main_grid,
+                outlier_score=float(score),
                 mass_ema=float(mass_ema),
-                raw_mass=float(loc.mass),
+                raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
                 state=str(state),
-                reason=f"verify_block({self._verify_block_left}) | score={score:.4f} stable_mass={stable_mass:.4f} "
-                       f"area_frac={area_frac:.3f} penalty={penalty:.2f} | {loc.reason}",
+                reason=f"verify_block({self._verify_block_left}) | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} "
+                       f"| loc={loc_reason}",
                 strength=None,
+                verified=None,
+                verify_stats=None,
             )
+
+        # If verifier is configured and marked as required, but required inputs are missing,
+        # raise exception to force caller to provide all verification callbacks.
+        if self.verifier is not None and bool(self.require_verify):
+            missing = []
+            if image is None:
+                missing.append("image")
+            if purify_fn is None:
+                missing.append("purify_fn")
+            if forward_fn is None:
+                missing.append("forward_fn")
+            if heatmap_fn is None:
+                missing.append("heatmap_fn")
+            
+            if missing:
+                raise ValueError(
+                    f"require_verify=True but missing required parameters: {', '.join(missing)}. "
+                    f"Please provide all verification callbacks in controller.step()."
+                )
 
         should, mass_ema, state, greason = self.gate.step(score)
+        prev_state = self._prev_gate_state
+        self._prev_gate_state = str(state)
 
         if not should:
+            # Unfreeze once HOLD has ended (next state becomes COOLDOWN/SAFE with should=False).
+            if prev_state == "HOLD":
+                self._frozen_outlier_grid = None
+                self._frozen_main_grid = None
+                self._frozen_outlier_score = 0.0
             return DefenseDecision(
                 should_purify=False,
                 roi_box=None,
                 grid_box=None,
+                main_grid_box=main_grid,
+                outlier_score=float(score),
                 mass_ema=float(mass_ema),
-                raw_mass=float(loc.mass),
+                raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
                 state=str(state),
-                reason=f"gate_off | score={score:.4f} stable_mass={stable_mass:.4f} "
-                       f"area_frac={area_frac:.3f} penalty={penalty:.2f} | {loc.reason} | {greason}",
+                reason=f"gate_off | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} | loc={loc_reason} | {greason}",
                 strength=None,
+                verified=None,
+                verify_stats=None,
             )
+
+        # Freeze ROI when we enter HOLD (reduce flicker across frames).
+        if bool(self.freeze_roi_in_hold) and prev_state != "HOLD":
+            # NOTE: Gate state labels come from temporal gate (SAFE/HOLD/COOLDOWN).
+            if str(state) == "HOLD":
+                self._frozen_outlier_grid = roi_grid
+                self._frozen_main_grid = main_grid
+                self._frozen_outlier_score = float(raw_outlier_score)
 
         # --- (E) map ROI grid -> pixel PatchBox ---
         x0, y0, x1, y1 = roi_grid.gx0, roi_grid.gy0, roi_grid.gx1, roi_grid.gy1
         roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
 
-        # --- (F) optional counterfactual verify (low frequency) ---
+        # --- (F) counterfactual verify (v3: on trigger edge only) ---
+        # We only verify on the trigger edge (SAFE -> HOLD) to reduce overhead and flicker.
         do_verify = (
             (self.verifier is not None)
+            and (prev_state != "HOLD")
+            and (str(state) == "HOLD")
             and (image is not None)
             and (purify_fn is not None)
             and (forward_fn is not None)
             and (heatmap_fn is not None)
-            and (self.verify_every_k > 0)
-            and ((self._t % self.verify_every_k) == 0)
         )
+
+        verify_stats: Optional[dict] = None
+        verified: Optional[bool] = None
 
         if do_verify:
             hm_before = heatmap_fn()
-            
-            # IMPORTANT: ensure the next forward produces a fresh attention/heatmap
-            # Wrap forward_fn to clear hook cache before forward, ensuring verify reads new heatmap
+
+            # IMPORTANT: ensure the next forward produces a fresh attention/heatmap.
             def _forward_with_clear(img: np.ndarray) -> Any:
                 if hasattr(self.hook, "clear"):
                     self.hook.clear()
                 return forward_fn(img)  # type: ignore[misc]
+
+            # Map main_grid to pixel coordinates for verifier (if available)
+            main_roi_box = None
+            if main_grid is not None:
+                mx0, my0, mx1, my1 = main_grid.gx0, main_grid.gy0, main_grid.gx1, main_grid.gy1
+                main_roi_box = self.hook.grid_bbox_to_patch_box(int(mx0), int(my0), int(mx1), int(my1))
 
             vr = self.verifier.verify(
                 image=image,
@@ -667,18 +631,49 @@ class OnlinePatchDefenseController:
                 forward_fn=_forward_with_clear,
                 heatmap_fn=heatmap_fn,
                 hm_before=hm_before,
+                main_roi_box=main_roi_box,  # Pass mainland ROI for task preservation check
             )
+            verified = bool(vr.verified)
+            verify_stats = dict(vr.stats)
+
             if not vr.verified:
-                self._verify_block_left = int(self.verify_block_frames)
+                # Use verdict_code and block_suggest_frames from verifier result
+                if vr.verdict_code == "FAIL_TASK_HARM":
+                    # Hard block to avoid repeatedly harming task region
+                    self._verify_block_left = int(vr.block_suggest_frames)
+                    self.gate.reset()
+                    self._prev_gate_state = "SAFE"
+                    self._frozen_outlier_grid = None
+                    self._frozen_main_grid = None
+                    self._frozen_outlier_score = 0.0
+                elif vr.verdict_code == "FAIL_NO_SUPPRESSION":
+                    # Don't block, but record (ROI might be wrong)
+                    self._verify_block_left = int(vr.block_suggest_frames)
+                elif vr.verdict_code == "FAIL_NO_ACTION_CHANGE":
+                    # Don't block, but record (purifier might be too weak)
+                    self._verify_block_left = int(vr.block_suggest_frames)
+                else:
+                    # Fallback to default block
+                    self._verify_block_left = int(self.verify_block_frames)
+                    self.gate.reset()
+                    self._prev_gate_state = "SAFE"
+                    self._frozen_outlier_grid = None
+                    self._frozen_main_grid = None
+                    self._frozen_outlier_score = 0.0
+
                 return DefenseDecision(
                     should_purify=False,
                     roi_box=None,
                     grid_box=None,
+                    main_grid_box=main_grid,
+                    outlier_score=float(score),
                     mass_ema=float(mass_ema),
-                    raw_mass=float(loc.mass),
-                    state=str(state),
-                    reason=f"verify_fail -> block | stats={vr.stats}",
+                    raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
+                    state="SAFE",
+                    reason=f"verify_fail[{vr.verdict_code}] -> block({self._verify_block_left}) | {vr.reason}",
                     strength=None,
+                    verified=False,
+                    verify_stats=verify_stats,
                 )
 
         # --- (G) final decision ---
@@ -692,12 +687,15 @@ class OnlinePatchDefenseController:
             should_purify=True,
             roi_box=roi_box,
             grid_box=GridBox(gx0=int(x0), gy0=int(y0), gx1=int(x1), gy1=int(y1)),
+            main_grid_box=main_grid,
+            outlier_score=float(score),
             mass_ema=float(mass_ema),
-            raw_mass=float(loc.mass),
+            raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
             state=str(state),
-            reason=f"TRIGGER | score={score:.4f} stable_mass={stable_mass:.4f} "
-                   f"area_frac={area_frac:.3f} penalty={penalty:.2f} | motion_penalty_applied | {loc.reason} | {greason}",
+            reason=f"TRIGGER | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} | loc={loc_reason} | {greason}",
             strength=strength,
+            verified=verified,
+            verify_stats=verify_stats,
         )
 
 
@@ -721,6 +719,10 @@ class UnifiedDefenseResult:
     state: str = "SAFE"
     reason: str = ""
     strength: Optional[float] = None
+
+    # Verifier fields (from counterfactual verification)
+    verified: Optional[bool] = None
+    verify_stats: Optional[dict] = None
 
     # Optional visualization
     heatmap: Optional[np.ndarray] = None
@@ -842,5 +844,7 @@ class UnifiedDefenseInterface:
             state=str(dd.state),
             reason=str(dd.reason),
             strength=dd.strength,
+            verified=dd.verified,
+            verify_stats=dd.verify_stats,
             heatmap=heatmap,
         )

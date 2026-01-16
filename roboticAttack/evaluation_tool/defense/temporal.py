@@ -44,6 +44,22 @@ class GridBox:
         cy = (self.gy0 + self.gy1) * 0.5
         return float(cx), float(cy)
 
+    def width(self) -> int:
+        # Width in grid cells
+        return int(max(0, self.gx1 - self.gx0))
+
+    def height(self) -> int:
+        # Height in grid cells
+        return int(max(0, self.gy1 - self.gy0))
+
+    def area(self) -> int:
+        # Area in grid cells
+        return int(self.width() * self.height())
+
+    def as_tuple(self) -> Tuple[int, int, int, int]:
+        # (x0, y0, x1, y1) in grid coordinates
+        return int(self.gx0), int(self.gy0), int(self.gx1), int(self.gy1)
+
 
 @dataclass
 class Stats2DResult:
@@ -141,6 +157,16 @@ def _iou(a: GridBox, b: GridBox) -> float:
     area_b = max(0, bx1 - bx0) * max(0, by1 - by0)
     denom = float(area_a + area_b - inter) + 1e-6
     return float(inter / denom)
+
+
+def grid_iou(a: GridBox, b: GridBox) -> float:
+    """Public IoU helper for GridBox.
+
+    Note:
+        _iou() is kept as a private implementation detail. This wrapper is used
+        by other modules (e.g., temporal localizers) for association/matching.
+    """
+    return _iou(a, b)
 
 
 @dataclass
