@@ -231,6 +231,8 @@ class GateDecision:
     should_purify: bool
     state: str
     checked: bool
+    # Optional debug reason. Kept empty by default for backward compatibility.
+    reason: str = ""
 
 
 @dataclass
@@ -258,6 +260,20 @@ class TemporalGate:
         self._hold_left = 0
         self._cool_left = 0
 
+    def force_safe(self, *, reason: str = "forced_safe") -> GateDecision:
+        """Immediately return to SAFE and stop purifying."""
+        self.state = "SAFE"
+        self._hold_left = 0
+        self._cool_left = 0
+        return GateDecision(should_purify=False, state=self.state, checked=True, reason=str(reason))
+
+    def force_cooldown(self, frames: int, *, reason: str = "forced_cooldown") -> GateDecision:
+        """Immediately enter COOLDOWN for `frames` steps (no purification)."""
+        self.state = "COOLDOWN"
+        self._hold_left = 0
+        self._cool_left = int(max(0, frames))
+        return GateDecision(should_purify=False, state=self.state, checked=True, reason=str(reason))
+
     def step(self, score: float) -> GateDecision:
         self._t += 1
 
@@ -267,28 +283,28 @@ class TemporalGate:
             if self._hold_left <= 0:
                 self.state = "COOLDOWN"
                 self._cool_left = int(self.cooldown_frames)
-            return GateDecision(should_purify=True, state=self.state, checked=False)
+            return GateDecision(should_purify=True, state=self.state, checked=False, reason="hold")
 
         # COOLDOWN: never purify
         if self.state == "COOLDOWN":
             self._cool_left -= 1
             if self._cool_left <= 0:
                 self.state = "SAFE"
-            return GateDecision(should_purify=False, state=self.state, checked=False)
+            return GateDecision(should_purify=False, state=self.state, checked=False, reason="cooldown")
 
         # SAFE: low-frequency check
         if int(self.check_every_k) > 1 and (self._t % int(self.check_every_k)) != 0:
-            return GateDecision(should_purify=False, state=self.state, checked=False)
+            return GateDecision(should_purify=False, state=self.state, checked=False, reason="skip_check")
 
         # checked now
         if score >= float(self.theta_on):
             self.state = "HOLD"
             self._hold_left = int(self.hold_frames)
-            return GateDecision(should_purify=True, state=self.state, checked=True)
+            return GateDecision(should_purify=True, state=self.state, checked=True, reason="trigger_on")
 
         # Optional: hysteresis off (not strictly needed in SAFE)
         if score <= float(self.theta_off):
-            return GateDecision(should_purify=False, state=self.state, checked=True)
+            return GateDecision(should_purify=False, state=self.state, checked=True, reason="safe_off")
 
-        return GateDecision(should_purify=False, state=self.state, checked=True)
+        return GateDecision(should_purify=False, state=self.state, checked=True, reason="safe_mid")
 

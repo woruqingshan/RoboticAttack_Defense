@@ -100,6 +100,9 @@ class CounterfactualVerifier:
     # Tier 1: Island suppression (existing)
     min_mass_drop_rel: float = 0.15   # require roi_mass_after <= (1 - rel)*before
     min_entropy_gain_abs: float = 0.02
+    # If False, entropy_gain becomes a soft signal (logged + affects credibility slightly),
+    # and Tier-1 suppression is decided primarily by roi_mass_rel_drop.
+    entropy_hard: bool = False
     
     # Tier 2: Task preservation (NEW)
     max_main_mass_drop_rel: float = 0.10  # mainland mass drop should not exceed this
@@ -204,11 +207,9 @@ class CounterfactualVerifier:
         m0_safe = max(m0_outlier, float(self.eps))
         outlier_mass_drop = (m0_safe - m1_outlier) / m0_safe
         entropy_gain = e1 - e0
-
-        island_suppressed = (
-            outlier_mass_drop >= float(self.min_mass_drop_rel)
-            and entropy_gain >= float(self.min_entropy_gain_abs)
-        )
+        mass_ok = outlier_mass_drop >= float(self.min_mass_drop_rel)
+        entropy_ok = entropy_gain >= float(self.min_entropy_gain_abs)
+        island_suppressed = bool(mass_ok and (entropy_ok if bool(self.entropy_hard) else True))
 
         # === Tier 2: Task Preservation ===
         task_preserved = True
@@ -245,10 +246,11 @@ class CounterfactualVerifier:
             verdict_code = "FAIL_NO_SUPPRESSION"
             credibility_delta = float(self.credibility_fail_suppression_penalty)
             block_suggest_frames = int(self.block_frames_no_suppression)
-            reason = (
-                f"Island not suppressed: mass_drop={outlier_mass_drop:.3f} < {self.min_mass_drop_rel}, "
-                f"entropy_gain={entropy_gain:.3f} < {self.min_entropy_gain_abs}"
-            )
+            if not mass_ok:
+                reason = f"Island not suppressed: mass_drop={outlier_mass_drop:.3f} < {self.min_mass_drop_rel}"
+            else:
+                # Only reachable when entropy_hard=True
+                reason = f"Island not suppressed: entropy_gain={entropy_gain:.3f} < {self.min_entropy_gain_abs}"
         elif not task_preserved:
             verdict_code = "FAIL_TASK_HARM"
             credibility_delta = float(self.credibility_fail_task_penalty)
@@ -267,7 +269,15 @@ class CounterfactualVerifier:
             verdict_code = "PASS"
             credibility_delta = float(self.credibility_pass_bonus)
             block_suggest_frames = 0
-            reason = "All checks passed"
+            # Soft entropy signal: if entropy_hard=False, we keep PASS but slightly downweight confidence.
+            if (not bool(self.entropy_hard)) and (not entropy_ok) and (float(self.min_entropy_gain_abs) > 0.0):
+                credibility_delta = float(credibility_delta - 0.05)
+                reason = (
+                    "All hard checks passed (entropy soft-fail): "
+                    f"entropy_gain={entropy_gain:.3f} < {self.min_entropy_gain_abs}"
+                )
+            else:
+                reason = "All checks passed"
 
         # === Build Stats Dict ===
         stats = {
@@ -278,6 +288,8 @@ class CounterfactualVerifier:
             "entropy_before": float(e0),
             "entropy_after": float(e1),
             "entropy_gain": float(entropy_gain),
+            "tier1_mass_ok": 1.0 if mass_ok else 0.0,
+            "tier1_entropy_ok": 1.0 if entropy_ok else 0.0,
             
             # Tier 2: Task preservation
             "main_mass_before": float(m0_mainland) if m0_mainland is not None else 0.0,

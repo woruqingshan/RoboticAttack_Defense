@@ -34,7 +34,7 @@ from .temporal import (
     ROITracker,
     TemporalGate as _PulseGate,
 )
-from .verifier import CounterfactualVerifier
+from .verifier import CounterfactualVerifier, roi_mass as heatmap_roi_mass
 
 if TYPE_CHECKING:  # pragma: no cover
     # Only for type hints; avoid runtime circular imports.
@@ -245,6 +245,9 @@ class TemporalGate:
         self.ema_alpha = float(ema_alpha)
 
         self.mass_ema = 0.0
+        # Whether the underlying pulse gate performed a "checked" decision on the latest step.
+        # Useful for logging/diagnostics without changing the legacy .step() signature.
+        self.last_checked: bool = False
         self._pulse = _PulseGate(
             theta_on=float(theta_on),
             theta_off=float(theta_off),
@@ -257,12 +260,33 @@ class TemporalGate:
         self.mass_ema = 0.0
         self._pulse.reset()
 
+    def force_safe(self, *, reason: str = "forced_safe") -> Tuple[bool, float, str, str]:
+        """
+        Hard interrupt: immediately return to SAFE and stop purifying.
+        Returns the legacy tuple signature for compatibility.
+        """
+        gd = self._pulse.force_safe(reason=str(reason))
+        self.last_checked = bool(gd.checked)
+        r = f"{gd.reason} mass_ema={self.mass_ema:.3f} state={gd.state}"
+        return bool(gd.should_purify), float(self.mass_ema), str(gd.state), str(r)
+
+    def force_cooldown(self, frames: int, *, reason: str = "forced_cooldown") -> Tuple[bool, float, str, str]:
+        """
+        Hard interrupt: immediately enter COOLDOWN for `frames` steps.
+        Returns the legacy tuple signature for compatibility.
+        """
+        gd = self._pulse.force_cooldown(int(frames), reason=str(reason))
+        self.last_checked = bool(gd.checked)
+        r = f"{gd.reason} mass_ema={self.mass_ema:.3f} state={gd.state} cool_left={int(frames)}"
+        return bool(gd.should_purify), float(self.mass_ema), str(gd.state), str(r)
+
     def step(self, mass: float) -> Tuple[bool, float, str, str]:
         m = float(max(0.0, mass))
         # Always update mass_ema (even if gate skips check) for consistency
         self.mass_ema = (1.0 - self.ema_alpha) * self.mass_ema + self.ema_alpha * m
 
         gd = self._pulse.step(self.mass_ema)
+        self.last_checked = bool(gd.checked)
         # Provide more detailed reason for debugging
         if gd.checked:
             if gd.should_purify:
@@ -294,6 +318,12 @@ class DefenseDecision:
     strength: Optional[float] = None
     verified: Optional[bool] = None
     verify_stats: Optional[dict] = None
+    # New: quality signals in heatmap space (aligned with verifier.roi_mass).
+    mass_heatmap: Optional[float] = None
+    quality_ok: Optional[bool] = None
+    quality_reason: str = ""
+    gate_checked: Optional[bool] = None
+    verdict_code: str = "NA"
 
 
 class OnlinePatchDefenseController:
@@ -332,6 +362,16 @@ class OnlinePatchDefenseController:
         # v3: reduce flicker and enforce counterfactual evidence
         freeze_roi_in_hold: bool = True,
         require_verify: bool = False,
+        # v4: hard quality gate to prevent triggering on empty/low-mass ROI
+        min_trigger_patch_mass: float = 0.02,
+        # v5: quality gate aligned with verifier space (heatmap). If heatmap_fn is provided,
+        # this threshold is preferred over min_trigger_patch_mass (grid-space).
+        min_trigger_mass_heatmap: float = 0.02,
+        quality_mass_source: str = "heatmap",  # "heatmap" | "grid"
+        # v5: hard interrupt when quality/verification fails (break HOLD pulse)
+        fail_cooldown_frames: int = 10,
+        exit_hold_on_low_quality: bool = True,
+        freeze_requires_verify: bool = False,
     ) -> None:
         self.hook = hook
         self.localizer = localizer
@@ -361,6 +401,13 @@ class OnlinePatchDefenseController:
         # v3: freeze ROI during HOLD to reduce flicker
         self.freeze_roi_in_hold = bool(freeze_roi_in_hold)
         self.require_verify = bool(require_verify)
+        # Hard gate: do not trigger if the localized ROI has too little attention mass.
+        self.min_trigger_patch_mass = float(min_trigger_patch_mass)
+        self.min_trigger_mass_heatmap = float(min_trigger_mass_heatmap)
+        self.quality_mass_source = str(quality_mass_source)
+        self.fail_cooldown_frames = int(fail_cooldown_frames)
+        self.exit_hold_on_low_quality = bool(exit_hold_on_low_quality)
+        self.freeze_requires_verify = bool(freeze_requires_verify)
         self._prev_gate_state: str = "SAFE"
         self._frozen_outlier_grid: Optional[GridBox] = None
         self._frozen_main_grid: Optional[GridBox] = None
@@ -448,6 +495,8 @@ class OnlinePatchDefenseController:
         purify_fn: Optional[Callable[[np.ndarray, PatchBox], np.ndarray]] = None,
         forward_fn: Optional[Callable[[np.ndarray], Any]] = None,
         heatmap_fn: Optional[Callable[[], np.ndarray]] = None,
+        frame_idx: Optional[int] = None,
+        hm_current: Optional[np.ndarray] = None,
     ) -> DefenseDecision:
         """
         Args:
@@ -511,11 +560,54 @@ class OnlinePatchDefenseController:
                 strength=None,
                 verified=None,
                 verify_stats=None,
+                mass_heatmap=None,
+                quality_ok=None,
+                quality_reason="no_roi",
             )
+
+        # --- (C0) map ROI grid -> pixel PatchBox early (needed for heatmap-space quality gate) ---
+        x0, y0, x1, y1 = roi_grid.gx0, roi_grid.gy0, roi_grid.gx1, roi_grid.gy1
+        roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
 
         # Gate expects a bounded score (historically in [0,1]).
         # We clamp the temporal localizer score to keep existing theta_on/off semantics usable.
         score = float(np.clip(raw_outlier_score, 0.0, 1.0))
+
+        # --- (C1) hard quality gate (aligned with verifier space when possible) ---
+        # We keep grid-space mass for debugging (loc_debug["best"]["m"]), but prefer heatmap-space ROI mass
+        # because it is consistent with verifier.roi_mass().
+        mass_grid: Optional[float] = None
+        if (not use_frozen) and isinstance(loc_debug, dict):
+            try:
+                mass_grid = float(loc_debug.get("best", {}).get("m", 0.0))
+            except Exception:
+                mass_grid = None
+
+        mass_heatmap: Optional[float] = None
+        hm_now: Optional[np.ndarray] = None
+        if hm_current is not None:
+            hm_now = hm_current
+        elif heatmap_fn is not None:
+            try:
+                hm_now = heatmap_fn()
+            except Exception:
+                hm_now = None
+        if hm_now is not None:
+            try:
+                mass_heatmap = float(heatmap_roi_mass(hm_now, roi_box))
+            except Exception:
+                mass_heatmap = None
+
+        # Decide which mass to use for hard quality gate.
+        use_heatmap_mass = (self.quality_mass_source.lower() == "heatmap") and (mass_heatmap is not None)
+        thr = float(self.min_trigger_mass_heatmap if use_heatmap_mass else self.min_trigger_patch_mass)
+        m_used = float(mass_heatmap) if use_heatmap_mass else float(mass_grid if mass_grid is not None else 0.0)
+        allow_trigger = bool(m_used >= thr)
+        quality_reason = ("heatmap" if use_heatmap_mass else "grid") + f"_mass={m_used:.4f}>=thr={thr:.4f}"
+        if not allow_trigger:
+            # Prevent new trigger. Note: if we are already in HOLD, we must force-exit below.
+            score = 0.0
+            quality_reason = ("heatmap" if use_heatmap_mass else "grid") + f"_mass={m_used:.4f}<thr={thr:.4f}"
 
         # verification fail blocking (avoid repeated false masking)
         if self._verify_block_left > 0:
@@ -529,13 +621,18 @@ class OnlinePatchDefenseController:
                 main_grid_box=main_grid,
                 outlier_score=float(score),
                 mass_ema=float(mass_ema),
-                raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
+                raw_mass=float(mass_grid if mass_grid is not None else 0.0),
                 state=str(state),
                 reason=f"verify_block({self._verify_block_left}) | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} "
                        f"| loc={loc_reason}",
                 strength=None,
                 verified=None,
                 verify_stats=None,
+                mass_heatmap=mass_heatmap,
+                quality_ok=allow_trigger,
+                quality_reason=str(quality_reason),
+                gate_checked=bool(self.gate.last_checked),
+                verdict_code="NA",
             )
 
         # If verifier is configured and marked as required, but required inputs are missing,
@@ -561,6 +658,38 @@ class OnlinePatchDefenseController:
         prev_state = self._prev_gate_state
         self._prev_gate_state = str(state)
 
+        # If we are in HOLD but quality is not OK, we must break the pulse immediately.
+        # This is crucial: HOLD would otherwise keep purifying even when score is forced to 0.
+        if bool(self.exit_hold_on_low_quality) and (str(state) == "HOLD") and (not allow_trigger):
+            _s, _m, forced_state, forced_reason = self.gate.force_cooldown(
+                self.fail_cooldown_frames,
+                reason=f"low_quality_exit_hold[{quality_reason}]",
+            )
+            self._prev_gate_state = str(forced_state)
+            self._frozen_outlier_grid = None
+            self._frozen_main_grid = None
+            self._frozen_outlier_score = 0.0
+            self._verify_block_left = max(int(self._verify_block_left), int(self.fail_cooldown_frames))
+            return DefenseDecision(
+                should_purify=False,
+                roi_box=None,
+                grid_box=None,
+                main_grid_box=main_grid,
+                outlier_score=float(score),
+                mass_ema=float(mass_ema),
+                raw_mass=float(mass_grid if mass_grid is not None else 0.0),
+                state=str(forced_state),
+                reason=f"force_exit_hold | {forced_reason}",
+                strength=None,
+                verified=None,
+                verify_stats=None,
+                mass_heatmap=mass_heatmap,
+                quality_ok=False,
+                quality_reason=str(quality_reason),
+                gate_checked=bool(self.gate.last_checked),
+                verdict_code="NA",
+            )
+
         if not should:
             # Unfreeze once HOLD has ended (next state becomes COOLDOWN/SAFE with should=False).
             if prev_state == "HOLD":
@@ -574,25 +703,41 @@ class OnlinePatchDefenseController:
                 main_grid_box=main_grid,
                 outlier_score=float(score),
                 mass_ema=float(mass_ema),
-                raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
+                raw_mass=float(mass_grid if mass_grid is not None else 0.0),
                 state=str(state),
-                reason=f"gate_off | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} | loc={loc_reason} | {greason}",
+                reason=(
+                    f"gate_off | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} "
+                    f"| loc={loc_reason} | {greason}"
+                    + (
+                        f" | low_quality_block {quality_reason}"
+                        if not allow_trigger
+                        else ""
+                    )
+                ),
                 strength=None,
                 verified=None,
                 verify_stats=None,
+                mass_heatmap=mass_heatmap,
+                quality_ok=allow_trigger,
+                quality_reason=str(quality_reason),
+                gate_checked=bool(self.gate.last_checked),
+                verdict_code="NA",
             )
 
         # Freeze ROI when we enter HOLD (reduce flicker across frames).
         if bool(self.freeze_roi_in_hold) and prev_state != "HOLD":
             # NOTE: Gate state labels come from temporal gate (SAFE/HOLD/COOLDOWN).
             if str(state) == "HOLD":
-                self._frozen_outlier_grid = roi_grid
-                self._frozen_main_grid = main_grid
-                self._frozen_outlier_score = float(raw_outlier_score)
-
-        # --- (E) map ROI grid -> pixel PatchBox ---
-        x0, y0, x1, y1 = roi_grid.gx0, roi_grid.gy0, roi_grid.gx1, roi_grid.gy1
-        roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+                # If requested, defer freezing until verifier passes on this trigger edge.
+                if (not bool(self.freeze_requires_verify)) or (self.verifier is None):
+                    if allow_trigger:
+                        self._frozen_outlier_grid = roi_grid
+                        self._frozen_main_grid = main_grid
+                        self._frozen_outlier_score = float(raw_outlier_score)
+                    else:
+                        self._frozen_outlier_grid = None
+                        self._frozen_main_grid = None
+                        self._frozen_outlier_score = 0.0
 
         # --- (F) counterfactual verify (v3: on trigger edge only) ---
         # We only verify on the trigger edge (SAFE -> HOLD) to reduce overhead and flicker.
@@ -637,29 +782,17 @@ class OnlinePatchDefenseController:
             verify_stats = dict(vr.stats)
 
             if not vr.verified:
-                # Use verdict_code and block_suggest_frames from verifier result
-                if vr.verdict_code == "FAIL_TASK_HARM":
-                    # Hard block to avoid repeatedly harming task region
-                    self._verify_block_left = int(vr.block_suggest_frames)
-                    self.gate.reset()
-                    self._prev_gate_state = "SAFE"
-                    self._frozen_outlier_grid = None
-                    self._frozen_main_grid = None
-                    self._frozen_outlier_score = 0.0
-                elif vr.verdict_code == "FAIL_NO_SUPPRESSION":
-                    # Don't block, but record (ROI might be wrong)
-                    self._verify_block_left = int(vr.block_suggest_frames)
-                elif vr.verdict_code == "FAIL_NO_ACTION_CHANGE":
-                    # Don't block, but record (purifier might be too weak)
-                    self._verify_block_left = int(vr.block_suggest_frames)
-                else:
-                    # Fallback to default block
-                    self._verify_block_left = int(self.verify_block_frames)
-                    self.gate.reset()
-                    self._prev_gate_state = "SAFE"
-                    self._frozen_outlier_grid = None
-                    self._frozen_main_grid = None
-                    self._frozen_outlier_score = 0.0
+                # Hard rule: verification failure must break HOLD pulse and unfreeze ROI.
+                self._verify_block_left = max(int(self.verify_block_frames), int(vr.block_suggest_frames))
+                cooldown = max(int(self.fail_cooldown_frames), int(self._verify_block_left))
+                _s, _m, forced_state, forced_reason = self.gate.force_cooldown(
+                    cooldown,
+                    reason=f"verify_fail[{vr.verdict_code}]",
+                )
+                self._prev_gate_state = str(forced_state)
+                self._frozen_outlier_grid = None
+                self._frozen_main_grid = None
+                self._frozen_outlier_score = 0.0
 
                 return DefenseDecision(
                     should_purify=False,
@@ -668,13 +801,28 @@ class OnlinePatchDefenseController:
                     main_grid_box=main_grid,
                     outlier_score=float(score),
                     mass_ema=float(mass_ema),
-                    raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
-                    state="SAFE",
-                    reason=f"verify_fail[{vr.verdict_code}] -> block({self._verify_block_left}) | {vr.reason}",
+                    raw_mass=float(mass_grid if mass_grid is not None else 0.0),
+                    state=str(forced_state),
+                    reason=f"{forced_reason} -> block({self._verify_block_left}) | {vr.reason}",
                     strength=None,
                     verified=False,
                     verify_stats=verify_stats,
+                    mass_heatmap=mass_heatmap,
+                    quality_ok=allow_trigger,
+                    quality_reason=str(quality_reason),
+                    gate_checked=bool(self.gate.last_checked),
+                    verdict_code=str(vr.verdict_code),
                 )
+            else:
+                # If we deferred freezing, commit it after verifier passes.
+                if bool(self.freeze_roi_in_hold) and bool(self.freeze_requires_verify) and allow_trigger:
+                    self._frozen_outlier_grid = roi_grid
+                    self._frozen_main_grid = main_grid
+                    self._frozen_outlier_score = float(raw_outlier_score)
+                # record PASS code
+                pass_verdict_code = str(vr.verdict_code)
+        else:
+            pass_verdict_code = "NA"
 
         # --- (G) final decision ---
         strength = self._mass_to_strength(float(mass_ema))
@@ -690,12 +838,17 @@ class OnlinePatchDefenseController:
             main_grid_box=main_grid,
             outlier_score=float(score),
             mass_ema=float(mass_ema),
-            raw_mass=float(loc_debug.get("best", {}).get("m", 0.0)) if isinstance(loc_debug, dict) else 0.0,
+            raw_mass=float(mass_grid if mass_grid is not None else 0.0),
             state=str(state),
             reason=f"TRIGGER | score={score:.4f} raw_outlier_score={raw_outlier_score:.4f} | loc={loc_reason} | {greason}",
             strength=strength,
             verified=verified,
             verify_stats=verify_stats,
+            mass_heatmap=mass_heatmap,
+            quality_ok=allow_trigger,
+            quality_reason=str(quality_reason),
+            gate_checked=bool(self.gate.last_checked),
+            verdict_code=str(pass_verdict_code),
         )
 
 
@@ -723,6 +876,12 @@ class UnifiedDefenseResult:
     # Verifier fields (from counterfactual verification)
     verified: Optional[bool] = None
     verify_stats: Optional[dict] = None
+    # Quality signals (aligned with verifier.roi_mass space when heatmap_fn is provided)
+    mass_heatmap: Optional[float] = None
+    quality_ok: Optional[bool] = None
+    quality_reason: str = ""
+    gate_checked: Optional[bool] = None
+    verdict_code: str = "NA"
 
     # Optional visualization
     heatmap: Optional[np.ndarray] = None
@@ -790,6 +949,8 @@ class UnifiedDefenseInterface:
         purify_fn: Optional[Callable[[np.ndarray, PatchBox], np.ndarray]] = None,
         forward_fn: Optional[Callable[[np.ndarray], Any]] = None,
         heatmap_fn: Optional[Callable[[], np.ndarray]] = None,
+        frame_idx: Optional[int] = None,
+        hm_current: Optional[np.ndarray] = None,
     ) -> UnifiedDefenseResult:
         """
         Args:
@@ -831,6 +992,8 @@ class UnifiedDefenseInterface:
             purify_fn=purify_fn,
             forward_fn=forward_fn,
             heatmap_fn=heatmap_fn,
+            frame_idx=frame_idx,
+            hm_current=hm_current,
         )
         heatmap = self.hook.get_heatmap() if self.use_heatmap_for_viz else None
 
@@ -846,5 +1009,10 @@ class UnifiedDefenseInterface:
             strength=dd.strength,
             verified=dd.verified,
             verify_stats=dd.verify_stats,
+            mass_heatmap=dd.mass_heatmap,
+            quality_ok=dd.quality_ok,
+            quality_reason=str(dd.quality_reason),
+            gate_checked=dd.gate_checked,
+            verdict_code=str(dd.verdict_code),
             heatmap=heatmap,
         )

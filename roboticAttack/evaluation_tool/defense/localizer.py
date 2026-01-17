@@ -505,10 +505,32 @@ class TemporalPatchAttentionLocalizer:
         self._miss_left = int(self.keepalive_frames)
 
         debug = {
-            "best": {"label": int(best_comp.label), "score": float(best_score), **best_feats},
+            "best": {
+                "label": int(best_comp.label),
+                "score": float(best_score),
+                # Explicit ROI grid coordinates for downstream debugging/logging.
+                # (The controller will map this GridBox to pixel PatchBox.)
+                "roi_grid": {
+                    "gx0": int(best_comp.roi.gx0),
+                    "gy0": int(best_comp.roi.gy0),
+                    "gx1": int(best_comp.roi.gx1),
+                    "gy1": int(best_comp.roi.gy1),
+                },
+                **best_feats,
+            },
             "main": {"label": int(main_label) if main_label is not None else None},
             "top3": [
-                {"label": int(c.label), "score": float(s), **f}
+                {
+                    "label": int(c.label),
+                    "score": float(s),
+                    "roi_grid": {
+                        "gx0": int(c.roi.gx0),
+                        "gy0": int(c.roi.gy0),
+                        "gx1": int(c.roi.gx1),
+                        "gy1": int(c.roi.gy1),
+                    },
+                    **f,
+                }
                 for (s, c, f) in candidates[:3]
             ],
             "tracker": {
