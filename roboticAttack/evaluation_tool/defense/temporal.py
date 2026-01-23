@@ -10,7 +10,7 @@ Key components:
 - RunningStats2D: EMA mean/variance + stable score for 2D grids
 - AttentionStabilityScorer: computes ROI mass score on stable grids
 - ROITracker: smooth ROI updates to reduce jitter
-- TemporalGate: low-frequency hysteresis + hold/cooldown pulse gate
+- TemporalGate: minimal hysteresis gate (continuous ON/OFF; no HOLD/COOLDOWN pulse)
 """
 
 from __future__ import annotations
@@ -233,78 +233,70 @@ class GateDecision:
     checked: bool
     # Optional debug reason. Kept empty by default for backward compatibility.
     reason: str = ""
+    # Smoothed score used by the gate (for logging/diagnostics).
+    score_ema: float = 0.0
 
 
 @dataclass
 class TemporalGate:
     """
-    Low-frequency hysteresis + hold/cooldown gate to avoid flicker.
+    Minimal hysteresis gate (continuous masking; no HOLD/COOLDOWN pulse).
 
-    States:
-    - SAFE: not purifying; only checks every K frames
-    - HOLD: purify for hold_frames frames (pulse)
-    - COOLDOWN: do not purify for cooldown_frames frames
+    This gate converts a scalar score into a stable ON/OFF decision.
+
+    Behavior:
+    - Uses EMA smoothing on the input score.
+    - Uses hysteresis (theta_on/theta_off) to reduce flicker.
+    - When score_ema >= theta_on => ON (purify)
+    - When score_ema <= theta_off => OFF (do not purify)
+
+    Notes:
+    - The legacy pulse-state machine (HOLD/COOLDOWN) is intentionally removed to support
+      "always overlap" masking in the simplified defense pipeline.
     """
     theta_on: float = 0.07
     theta_off: float = 0.05
-    hold_frames: int = 3
-    cooldown_frames: int = 2
-    check_every_k: int = 3
+    ema_alpha: float = 0.3
+    check_every_k: int = 1  # 1 means check every frame; kept for compatibility
 
     def __post_init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
+        # States are kept for backward compatibility with existing logs.
+        # In the simplified gate, we only use SAFE/HOLD as OFF/ON.
         self.state = "SAFE"
         self._t = 0
-        self._hold_left = 0
-        self._cool_left = 0
-
-    def force_safe(self, *, reason: str = "forced_safe") -> GateDecision:
-        """Immediately return to SAFE and stop purifying."""
-        self.state = "SAFE"
-        self._hold_left = 0
-        self._cool_left = 0
-        return GateDecision(should_purify=False, state=self.state, checked=True, reason=str(reason))
-
-    def force_cooldown(self, frames: int, *, reason: str = "forced_cooldown") -> GateDecision:
-        """Immediately enter COOLDOWN for `frames` steps (no purification)."""
-        self.state = "COOLDOWN"
-        self._hold_left = 0
-        self._cool_left = int(max(0, frames))
-        return GateDecision(should_purify=False, state=self.state, checked=True, reason=str(reason))
+        self._score_ema = 0.0
 
     def step(self, score: float) -> GateDecision:
         self._t += 1
+        s = float(max(0.0, score))
 
-        # HOLD: always purify
-        if self.state == "HOLD":
-            self._hold_left -= 1
-            if self._hold_left <= 0:
-                self.state = "COOLDOWN"
-                self._cool_left = int(self.cooldown_frames)
-            return GateDecision(should_purify=True, state=self.state, checked=False, reason="hold")
-
-        # COOLDOWN: never purify
-        if self.state == "COOLDOWN":
-            self._cool_left -= 1
-            if self._cool_left <= 0:
-                self.state = "SAFE"
-            return GateDecision(should_purify=False, state=self.state, checked=False, reason="cooldown")
-
-        # SAFE: low-frequency check
+        # Optional low-frequency checking (kept for backward compatibility).
+        # In the simplified pipeline we prefer check_every_k=1 (check every frame).
         if int(self.check_every_k) > 1 and (self._t % int(self.check_every_k)) != 0:
-            return GateDecision(should_purify=False, state=self.state, checked=False, reason="skip_check")
+            return GateDecision(should_purify=False, state="SAFE", checked=False, reason="skip_check")
 
-        # checked now
-        if score >= float(self.theta_on):
+        # EMA smoothing + hysteresis.
+        a = float(np.clip(self.ema_alpha, 0.0, 1.0))
+        self._score_ema = (1.0 - a) * float(self._score_ema) + a * float(s)
+
+        if self.state != "HOLD" and float(self._score_ema) >= float(self.theta_on):
             self.state = "HOLD"
-            self._hold_left = int(self.hold_frames)
-            return GateDecision(should_purify=True, state=self.state, checked=True, reason="trigger_on")
+            return GateDecision(should_purify=True, state=self.state, checked=True, reason="on", score_ema=float(self._score_ema))
 
-        # Optional: hysteresis off (not strictly needed in SAFE)
-        if score <= float(self.theta_off):
-            return GateDecision(should_purify=False, state=self.state, checked=True, reason="safe_off")
+        if self.state == "HOLD" and float(self._score_ema) <= float(self.theta_off):
+            self.state = "SAFE"
+            return GateDecision(should_purify=False, state=self.state, checked=True, reason="off", score_ema=float(self._score_ema))
 
-        return GateDecision(should_purify=False, state=self.state, checked=True, reason="safe_mid")
+        # Keep previous state inside hysteresis band.
+        should = (self.state == "HOLD")
+        return GateDecision(
+            should_purify=bool(should),
+            state=self.state,
+            checked=True,
+            reason="hold" if should else "safe",
+            score_ema=float(self._score_ema),
+        )
 

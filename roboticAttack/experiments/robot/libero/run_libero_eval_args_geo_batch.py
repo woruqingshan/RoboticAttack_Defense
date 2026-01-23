@@ -95,7 +95,6 @@ from experiments.robot.robot_utils import (
 from evaluation_tool.defense import (
     ImagePurifier,
     OnlineAttentionHook,
-    PatchAttentionAnomalyDetector,
     PatchBox,
     # Unified interface and auto-mode components
     UnifiedDefenseInterface,
@@ -103,6 +102,9 @@ from evaluation_tool.defense import (
     TemporalGate,
     OnlinePatchDefenseController,
     CounterfactualVerifier,
+    NoOpVerifier,
+    format_defense_log_line,
+    defense_result_to_log_dict,
 )
 
 def _defense_debug_print(cfg, msg: str, log_file=None) -> None:
@@ -266,24 +268,17 @@ def eval_libero(cfg) -> None:
             pad=getattr(cfg, "defense_purifier_pad", 0),
             gray_value=getattr(cfg, "defense_gray_value", 127),
             alpha=getattr(cfg, "defense_purifier_alpha", 0.8),
-            bootstrap_frames=int(getattr(cfg, "defense_bootstrap_frames", 0)),
-            bootstrap_min_strength=float(getattr(cfg, "defense_purifier_bootstrap_min_strength", 0.0)),
         )
         
         # Create unified interface based on mode
         defense_mode = getattr(cfg, "defense_mode", "known")  # Default: backward compatible
         
         if defense_mode == "known":
-            # Known location mode (backward compatible)
-            defense_detector = PatchAttentionAnomalyDetector(
-                patch_mass_threshold=getattr(cfg, "defense_patch_mass_threshold", 0.25),
-                entropy_threshold=getattr(cfg, "defense_entropy_threshold", None),
-                use_entropy_gate=getattr(cfg, "defense_use_entropy_gate", False),
-            )
+            # Known location mode: always masks the patch at the given location (no detection needed)
             defense_interface = UnifiedDefenseInterface(
                 hook=defense_hook,
                 mode="known",
-                detector=defense_detector,
+                detector=None,  # No longer needed in known mode (deprecated)
                 patch_x=int(cfg.x),
                 patch_y=int(cfg.y),
                 patch_w=int(getattr(cfg, "defense_patch_w", 50)),
@@ -302,13 +297,10 @@ def eval_libero(cfg) -> None:
                 theta_on=getattr(cfg, "defense_gate_theta_on", 0.07),
                 theta_off=getattr(cfg, "defense_gate_theta_off", 0.05),
                 ema_alpha=getattr(cfg, "defense_gate_ema_alpha", 0.3),
-                hold_frames=getattr(cfg, "defense_gate_hold_frames", 5),
-                cooldown_frames=getattr(cfg, "defense_gate_cooldown_frames", 3),
                 check_every_k=getattr(cfg, "defense_gate_check_every_k", 3),
             )
             
             # Create verifier if enabled
-            verifier = None
             if getattr(cfg, "defense_verifier_enabled", True):  # Default: enabled
                 verifier = CounterfactualVerifier(
                     min_mass_drop_rel=getattr(cfg, "defense_verifier_min_mass_drop", 0.15),
@@ -320,26 +312,20 @@ def eval_libero(cfg) -> None:
                     min_gripper_diff=getattr(cfg, "defense_verifier_min_gripper_diff", 0.1),
                     use_action_verification=getattr(cfg, "defense_verifier_use_action", True),
                 )
+            else:
+                verifier = NoOpVerifier()
             
             controller = OnlinePatchDefenseController(
                 hook=defense_hook,
                 localizer=localizer,
                 gate=gate,
-                motion_threshold_cells=getattr(cfg, "defense_controller_motion_threshold", 1.2),
-                motion_penalty_weight=getattr(cfg, "defense_controller_motion_penalty_weight", 0.3),
-                tracker_iou_keep=getattr(cfg, "defense_controller_tracker_iou_keep", 0.30),
-                tracker_ema=getattr(cfg, "defense_controller_tracker_ema", 0.50),
-                top_k_candidates=getattr(cfg, "defense_top_k_candidates", 3),
                 verifier=verifier,
-                verify_every_k=getattr(cfg, "defense_verifier_every_k", 1),  # Verify on every trigger edge
-                verify_block_frames=getattr(cfg, "defense_verifier_block_frames", 6),
+                verify_every_k=getattr(cfg, "defense_verifier_every_k", 3),  # Verify every K frames during TRACK
                 require_verify=getattr(cfg, "defense_require_verify", False),  # Default: False (backward compatible)
                 min_trigger_mass_heatmap=getattr(cfg, "defense_min_trigger_mass_heatmap", 0.02),
                 quality_mass_source=getattr(cfg, "defense_quality_mass_source", "heatmap"),
-                fail_cooldown_frames=getattr(cfg, "defense_fail_cooldown_frames", 10),
-                exit_hold_on_low_quality=getattr(cfg, "defense_exit_hold_on_low_quality", True),
-                freeze_requires_verify=getattr(cfg, "defense_freeze_requires_verify", False),
-                # Backward compatibility: deprecated parameters are ignored by new controller
+                strength_min=getattr(cfg, "defense_strength_min", 0.35),
+                strength_max=getattr(cfg, "defense_strength_max", 0.85),
             )
             defense_interface = UnifiedDefenseInterface(
                 hook=defense_hook,
@@ -381,9 +367,13 @@ def eval_libero(cfg) -> None:
         if getattr(cfg, "single_task_id", None) is not None and task_id != int(cfg.single_task_id):
             continue
 
-        task_defense_triggers = 0
-        task_defense_patch_mass_sum = 0.0
-        task_defense_steps_checked = 0
+        # New semantics under ACQUIRE/TRACK:
+        # - masked_frames: number of frames where masking was applied
+        # - acquire_count: number of times we entered TRACK in this task
+        # - reacquire_count: number of times verifier requested a reacquire
+        task_masked_frames = 0
+        task_acquire_count = 0
+        task_reacquire_count = 0
 
         # Get task
         task = task_suite.get_task(task_id)
@@ -442,7 +432,10 @@ def eval_libero(cfg) -> None:
                 max_steps = 373  # longest training demo has 373 steps
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
-            episode_defense_triggers = 0
+            episode_masked_frames = 0
+            episode_acquire_count = 0
+            episode_reacquire_count = 0
+            prev_phase = None
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -499,7 +492,6 @@ def eval_libero(cfg) -> None:
                                         ),
                                     }, task_description, processor=processor),
                                     heatmap_fn=lambda: defense_hook.get_heatmap(),
-                                    frame_idx=int(t),
                                     hm_current=defense_hook.get_heatmap(),
                                 )
                             else:
@@ -517,43 +509,31 @@ def eval_libero(cfg) -> None:
                         if getattr(cfg, "defense_viz", False):
                             heatmap_for_viz = defense_result.heatmap
                         
-                        # Statistics (backward compatible)
-                        task_defense_steps_checked += 1
-                        task_defense_patch_mass_sum += float(defense_result.patch_mass)
+                        # Statistics (new semantics)
+                        dlog = defense_result_to_log_dict(defense_result)
+                        if bool(dlog.get("should_purify")) and dlog.get("roi_box") is not None:
+                            task_masked_frames += 1
+                            episode_masked_frames += 1
+                        # Count entering TRACK (ACQUIRE -> TRACK edge)
+                        if prev_phase != "TRACK" and dlog.get("phase") == "TRACK":
+                            task_acquire_count += 1
+                            episode_acquire_count += 1
+                        # Count verifier-triggered reacquire
+                        if bool(dlog.get("reacquire_needed")):
+                            task_reacquire_count += 1
+                            episode_reacquire_count += 1
+                        prev_phase = dlog.get("phase")
                         
-                        # Debug output (backward compatible + verifier details)
+                        # Debug output (structured; no legacy patch_mass/entropy)
                         if _defense_debug_every_step(cfg):
-                            verifier_info = ""
-                            if defense_result.verify_stats is not None:
-                                vs = defense_result.verify_stats
-                                verifier_info = (
-                                    f" | VERDICT={getattr(defense_result, 'verdict_code', 'NA')}"
-                                    f" | VERIFY: verified={defense_result.verified} "
-                                    f"roi_mass_drop={vs.get('roi_mass_rel_drop', 0):.3f} "
-                                    f"entropy_gain={vs.get('entropy_gain', 0):.3f} "
-                                    f"main_mass_drop={vs.get('main_mass_drop', 0):.3f} "
-                                    f"action_diff_l2={vs.get('action_diff_l2', 0):.4f} "
-                                    f"action_diff_rel={vs.get('action_diff_rel', 0):.3f} "
-                                    f"gripper_diff={vs.get('gripper_diff', 0):.3f}"
-                                )
-                            quality_info = (
-                                f" | MASS_HEATMAP={getattr(defense_result, 'mass_heatmap', None)}"
-                                f" | QUALITY_OK={getattr(defense_result, 'quality_ok', None)}"
-                                f" | QUALITY_REASON={getattr(defense_result, 'quality_reason', '')}"
-                                f" | GATE_CHECKED={getattr(defense_result, 'gate_checked', None)}"
-                            )
                             _defense_debug_print(
                                 cfg,
-                                f"[DEFENSE][CHECK] step={t} patch_mass={defense_result.patch_mass:.4f} "
-                                f"entropy={defense_result.entropy if defense_result.entropy is not None else 'NA'} "
-                                f"state={defense_result.state} reason={defense_result.reason}{quality_info}{verifier_info}",
+                                f"[DEFENSE] {format_defense_log_line(step=int(t), result=defense_result)}",
                                 log_file=log_file,
                             )
                         
                         # Check if purification is needed (unified field)
                         if defense_result.should_purify and defense_result.roi_box is not None:
-                            task_defense_triggers += 1
-                            episode_defense_triggers += 1
                             
                             # Purify image (unified interface)
                             # Use strength from defense_result if available (auto mode provides dynamic strength)
@@ -561,7 +541,6 @@ def eval_libero(cfg) -> None:
                                 img_for_policy,
                                 defense_result.roi_box,
                                 strength=getattr(defense_result, "strength", None),  # Use dynamic strength if available
-                                frame_idx=int(t),
                             )
                             
                             # Recompute action on purified image
@@ -570,31 +549,9 @@ def eval_libero(cfg) -> None:
                                 defense_interface.clear()
                                 action = get_action(cfg, model, observation, task_description, processor=processor)
                             
-                            # Enhanced trigger log with verifier details
-                            verifier_info = ""
-                            if defense_result.verify_stats is not None:
-                                vs = defense_result.verify_stats
-                                verifier_info = (
-                                    f" | VERDICT={getattr(defense_result, 'verdict_code', 'NA')}"
-                                    f" | VERIFY: verified={defense_result.verified} "
-                                    f"roi_mass_drop={vs.get('roi_mass_rel_drop', 0):.3f} "
-                                    f"entropy_gain={vs.get('entropy_gain', 0):.3f} "
-                                    f"main_mass_drop={vs.get('main_mass_drop', 0):.3f} "
-                                    f"action_diff_l2={vs.get('action_diff_l2', 0):.4f} "
-                                    f"action_diff_rel={vs.get('action_diff_rel', 0):.3f} "
-                                    f"gripper_diff={vs.get('gripper_diff', 0):.3f}"
-                                )
-                            quality_info = (
-                                f" | MASS_HEATMAP={getattr(defense_result, 'mass_heatmap', None)}"
-                                f" | QUALITY_OK={getattr(defense_result, 'quality_ok', None)}"
-                                f" | QUALITY_REASON={getattr(defense_result, 'quality_reason', '')}"
-                                f" | GATE_CHECKED={getattr(defense_result, 'gate_checked', None)}"
-                            )
                             _defense_debug_print(
                                 cfg,
-                                f"[DEFENSE][TRIGGER] step={t} patch_mass={defense_result.patch_mass:.4f} "
-                                f"state={defense_result.state} strategy={defense_purifier.strategy} "
-                                f"recompute={getattr(cfg, 'defense_recompute_action', True)}{quality_info}{verifier_info}",
+                                f"[DEFENSE][MASK] {format_defense_log_line(step=int(t), result=defense_result)}",
                                 log_file=log_file,
                             )
 
@@ -640,7 +597,8 @@ def eval_libero(cfg) -> None:
             )
             _defense_debug_print(
                 cfg,
-                f"[DEFENSE][EPISODE_END] episode={task_episodes+1} success={done} triggers={episode_defense_triggers}",
+                f"[DEFENSE][EPISODE_END] episode={task_episodes+1} success={done} "
+                f"masked_frames={episode_masked_frames} acquire_count={episode_acquire_count} reacquire_count={episode_reacquire_count}",
                 log_file=log_file,
             )
 
@@ -659,11 +617,11 @@ def eval_libero(cfg) -> None:
         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
         log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
         log_file.flush()
-        avg_patch_mass = (task_defense_patch_mass_sum / task_defense_steps_checked) if task_defense_steps_checked > 0 else 0.0
         _defense_debug_print(
             cfg,
-            f"[DEFENSE][TASK_END] task_id={task_id} episodes={task_episodes} success_rate={float(task_successes) / float(task_episodes):.3f} "
-            f"steps_checked={task_defense_steps_checked} triggers={task_defense_triggers} avg_patch_mass={avg_patch_mass:.4f}",
+            f"[DEFENSE][TASK_END] task_id={task_id} episodes={task_episodes} "
+            f"success_rate={float(task_successes) / float(task_episodes):.3f} "
+            f"masked_frames={task_masked_frames} acquire_count={task_acquire_count} reacquire_count={task_reacquire_count}",
             log_file=log_file,
         )
         if cfg.use_wandb:
@@ -765,26 +723,17 @@ def parse_args():
     parser.add_argument("--defense_gate_theta_on", type=float, default=0.07, help="Threshold to trigger masking (auto mode, hysteresis on).")
     parser.add_argument("--defense_gate_theta_off", type=float, default=0.05, help="Threshold to stop masking (auto mode, hysteresis off).")
     parser.add_argument("--defense_gate_ema_alpha", type=float, default=0.3, help="EMA smoothing coefficient for mass (auto mode).")
-    parser.add_argument("--defense_gate_hold_frames", type=int, default=5, help="Minimum frames to hold masking state (auto mode).")
-    parser.add_argument("--defense_gate_cooldown_frames", type=int, default=3, help="Cooldown frames after masking (auto mode).")
     parser.add_argument("--defense_gate_check_every_k", type=int, default=3, help="Only check trigger every k frames when SAFE (auto mode).")
-    parser.add_argument("--defense_controller_motion_threshold", type=float, default=1.2, help="Max centroid movement (grid cells) to be considered static (auto mode).")
-    parser.add_argument("--defense_controller_motion_penalty_weight", type=float, default=0.3, help="Motion penalty weight for candidate scoring (auto mode).")
-    parser.add_argument("--defense_controller_tracker_iou_keep", type=float, default=0.30, help="IoU threshold for ROI tracking stickiness (auto mode).")
-    parser.add_argument("--defense_controller_tracker_ema", type=float, default=0.50, help="EMA alpha for ROI position smoothing (auto mode).")
-    parser.add_argument("--defense_top_k_candidates", type=int, default=3, help="Number of top candidates to evaluate (auto mode).")
-    # Deprecated parameters (kept for backward compatibility)
-    parser.add_argument("--defense_controller_min_stable_frames", type=int, default=3, help="[DEPRECATED] Require this many consecutive static frames before trigger (auto mode).")
-    parser.add_argument("--defense_controller_track_iou", type=float, default=0.2, help="[DEPRECATED] IoU threshold for ROI tracking stickiness (auto mode).")
-    parser.add_argument("--defense_controller_max_jump", type=float, default=3.0, help="[DEPRECATED] Max jump distance (grid cells) to accept new ROI (auto mode).")
     # Purifier parameters
     parser.add_argument("--defense_purifier_strategy", type=str, default="mask_mean",
                         choices=["mask_mean", "mask_gray", "blend_mean", "blend_gray", "blur"],
                         help="Purifier strategy: mask_mean|mask_gray|blend_mean|blend_gray|blur.")
     parser.add_argument("--defense_purifier_pad", type=int, default=0, help="Pad patch box before purification (pixels).")
-    parser.add_argument("--defense_purifier_alpha", type=float, default=0.8, help="Blend strength for blend_* strategies (0-1).")
-    parser.add_argument("--defense_bootstrap_frames", type=int, default=0, help="Bootstrap frames for stronger early purification/triggering (0 disables).")
-    parser.add_argument("--defense_purifier_bootstrap_min_strength", type=float, default=0.0, help="Minimum purifier strength during bootstrap frames.")
+    parser.add_argument("--defense_purifier_alpha", type=float, default=1.0, help="Blend strength for blend_* strategies (0-1).")
+    parser.add_argument("--defense_strength_min", type=float, default=0.35,
+                        help="Minimum purifier strength for auto mode (0-1). Maps to [strength_min, strength_max] range.")
+    parser.add_argument("--defense_strength_max", type=float, default=0.85,
+                        help="Maximum purifier strength for auto mode (0-1). Set both to 1.0 for full masking in auto mode.")
     parser.add_argument("--defense_gray_value", type=int, default=127, help="Gray value when using mask_gray/blend_gray purifier.")
     parser.add_argument("--defense_recompute_action", type=str2bool, default=True, help="Recompute action using purified image when defense triggers.")
     parser.add_argument("--defense_debug", type=str2bool, default=False, help="Print defense debug logs to terminal and log file.")
@@ -801,15 +750,11 @@ def parse_args():
     parser.add_argument("--defense_verifier_min_action_diff_rel", type=float, default=0.05, help="Minimum relative action difference for verification (Tier 3).")
     parser.add_argument("--defense_verifier_min_gripper_diff", type=float, default=0.1, help="Minimum gripper action difference for verification (Tier 3).")
     parser.add_argument("--defense_verifier_use_action", type=str2bool, default=True, help="Enable action-level verification (Tier 3).")
-    parser.add_argument("--defense_verifier_every_k", type=int, default=1, help="Verify every k trigger edges (1 = verify on every trigger).")
-    parser.add_argument("--defense_verifier_block_frames", type=int, default=6, help="Block frames after verification failure.")
+    parser.add_argument("--defense_verifier_every_k", type=int, default=3, help="Verify every k frames during TRACK (auto mode).")
     parser.add_argument("--defense_require_verify", type=str2bool, default=False, help="Require verification to pass before purifying (strict mode).")
-    # Controller v5 (quality aligned with heatmap + forced exit on fail)
+    # Controller (quality aligned with heatmap)
     parser.add_argument("--defense_min_trigger_mass_heatmap", type=float, default=0.02, help="Min ROI mass on heatmap to allow trigger (auto mode).")
     parser.add_argument("--defense_quality_mass_source", type=str, default="heatmap", choices=["heatmap", "grid"], help="Mass source for quality gate (auto mode).")
-    parser.add_argument("--defense_fail_cooldown_frames", type=int, default=10, help="Cooldown frames after quality/verification failure (auto mode).")
-    parser.add_argument("--defense_exit_hold_on_low_quality", type=str2bool, default=True, help="Force-exit HOLD when ROI quality fails (auto mode).")
-    parser.add_argument("--defense_freeze_requires_verify", type=str2bool, default=False, help="Only freeze ROI after verifier PASS (auto mode).")
 
     args = parser.parse_args()
     return args

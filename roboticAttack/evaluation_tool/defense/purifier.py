@@ -37,27 +37,21 @@ class ImagePurifier:
     gray_value: int = 127
 
     # Soft purification controls
-    alpha: float = 0.8  # default blend strength (0=no change, 1=full replace)
+    alpha: float = 1.0  # default blend strength (0=no change, 1=full replace)
     blur_ksize: int = 7  # odd integer recommended
     blur_sigma: float = 2.0
-    # Optional bootstrap schedule (early frames can use stronger purification).
-    bootstrap_frames: int = 0           # 0 disables schedule
-    bootstrap_min_strength: float = 0.0 # if >0, enforce alpha >= this value during bootstrap
 
     def purify(
         self,
         image: np.ndarray,
         patch_box: PatchBox,
         strength: Optional[float] = None,
-        *,
-        frame_idx: Optional[int] = None,
     ) -> np.ndarray:
         """
         Args:
             image: HxWx3 RGB image (uint8 preferred).
             patch_box: ROI bbox in pixel coordinates.
             strength: Optional override for alpha (0..1). If None, uses self.alpha.
-            frame_idx: Optional episode step index for bootstrap scheduling.
 
         Returns:
             A purified image (uint8).
@@ -79,11 +73,6 @@ class ImagePurifier:
         # Strength override
         a = self.alpha if strength is None else float(strength)
         a = float(np.clip(a, 0.0, 1.0))
-        # Bootstrap schedule: in the first N frames, enforce a minimum strength to quickly suppress strong patches.
-        if frame_idx is not None and int(self.bootstrap_frames) > 0:
-            if int(frame_idx) <= int(self.bootstrap_frames):
-                a = float(max(a, float(self.bootstrap_min_strength)))
-                a = float(np.clip(a, 0.0, 1.0))
 
         out = img.copy()
         roi = out[box.y0 : box.y1, box.x0 : box.x1]

@@ -16,12 +16,16 @@ Three-tier verification:
 1. Tier 1 (Island Suppression): Check if outlier ROI mass drops after purification
 2. Tier 2 (Task Preservation): Check if mainland ROI mass does NOT drop significantly
 3. Tier 3 (Action-level Evidence): Check if policy action changes after purification
+
+Plugin mode:
+- This file also provides a minimal "NoOpVerifier" and an "enabled" switch in CounterfactualVerifier.
+- When disabled, verification is skipped (no extra forward cost) and the verifier returns verdict_code="SKIP".
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union, Protocol
 import numpy as np
 
 # Accept either (x0,y0,x1,y1) or an object with .x0,.y0,.x1,.y1
@@ -89,6 +93,54 @@ class VerifyResult:
     reason: str = ""  # Human-readable failure reason
 
 
+class VerifierProtocol(Protocol):
+    """Minimal verifier interface expected by the controller (plugin contract)."""
+
+    def verify(
+        self,
+        image: np.ndarray,
+        roi_box: BoxLike,
+        purify_fn: Callable[[np.ndarray, BoxLike], np.ndarray],
+        forward_fn: Callable[[np.ndarray], np.ndarray],
+        heatmap_fn: Callable[[], np.ndarray],
+        *,
+        hm_before: Optional[np.ndarray] = None,
+        main_roi_box: Optional[BoxLike] = None,
+    ) -> VerifyResult: ...
+
+
+@dataclass
+class NoOpVerifier:
+    """
+    No-op verifier plugin.
+
+    - It never blocks the pipeline.
+    - It does not call forward_fn / purify_fn / heatmap_fn (zero extra compute).
+    """
+
+    reason: str = "Verification disabled (NoOpVerifier)"
+
+    def verify(
+        self,
+        image: np.ndarray,
+        roi_box: BoxLike,
+        purify_fn: Callable[[np.ndarray, BoxLike], np.ndarray],
+        forward_fn: Callable[[np.ndarray], np.ndarray],
+        heatmap_fn: Callable[[], np.ndarray],
+        *,
+        hm_before: Optional[np.ndarray] = None,
+        main_roi_box: Optional[BoxLike] = None,
+    ) -> VerifyResult:
+        return VerifyResult(
+            verified=True,
+            stats={},
+            verdict_code="SKIP",
+            credibility_delta=0.0,
+            block_suggest_frames=0,
+            reason=str(self.reason),
+        )
+
+
 @dataclass
 class CounterfactualVerifier:
     """
@@ -126,6 +178,8 @@ class CounterfactualVerifier:
     block_frames_no_action: int = 0       # don't block if just no action change
     
     eps: float = 1e-8
+    # Plugin switch: when disabled, verification is skipped (no compute, verdict_code="SKIP").
+    enabled: bool = True
 
     def verify(
         self,
@@ -165,6 +219,17 @@ class CounterfactualVerifier:
         Returns:
             VerifyResult with verified flag, stats, verdict_code, and calibration suggestions
         """
+        # Plugin mode: skip verification completely (no forward/purify/heatmap calls).
+        if not bool(self.enabled):
+            return VerifyResult(
+                verified=True,
+                stats={},
+                verdict_code="SKIP",
+                credibility_delta=0.0,
+                block_suggest_frames=0,
+                reason="Verification disabled (CounterfactualVerifier.enabled=False)",
+            )
+
         # === BEFORE: Run policy on original image ===
         if hm_before is None:
             hm0 = heatmap_fn()

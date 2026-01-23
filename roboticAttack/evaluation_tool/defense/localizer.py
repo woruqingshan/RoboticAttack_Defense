@@ -7,7 +7,15 @@ This module is decoupled and depends only on numpy.
 It provides connected-component localization on a thresholded stable grid.
 
 Main API:
-- AttentionLocalizer.localize(stable_grid) -> Optional[LocalizeResult]
+- TemporalPatchAttentionLocalizer.localize(stable_grid) -> TemporalLocalizeResult
+
+Design note:
+- This module ONLY localizes and scores candidate regions on a (stable) attention grid.
+- It must NOT implement temporal gating (HOLD/COOLDOWN), purification, or verification.
+
+Backward compatibility:
+- AttentionLocalizer/LocalizeResult are kept as legacy utilities. New code should prefer
+  TemporalPatchAttentionLocalizer/TemporalLocalizeResult.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from .temporal import GridBox, ROITracker, grid_iou
 
 @dataclass
 class LocalizeResult:
+    """Legacy single-frame localization result (kept for backward compatibility)."""
     roi: GridBox
     roi_mass: float
     area_ratio: float
@@ -88,7 +97,7 @@ def _bbox_from_label(labels: np.ndarray, lab: int) -> Optional[GridBox]:
 @dataclass
 class AttentionLocalizer:
     """
-    Localize suspicious ROI from a stable attention grid.
+    Legacy localizer: localize suspicious ROI from a stable attention grid (single-frame).
 
     Strategy:
     1) Normalize stable_grid (shift by min)
@@ -328,6 +337,11 @@ class TemporalPatchAttentionLocalizer:
       - mainland ROI (for debugging)
       - outlier ROI (candidate patch region on the grid)
       - outlier_score + rich debug fields
+
+    Contract:
+      - Input: stable_grid (2D numpy array, typically a temporal-stability score grid).
+      - Output: TemporalLocalizeResult(main_roi, outlier_roi, outlier_score, debug).
+      - This class does NOT decide whether to purify; the caller (controller) must handle gating.
     """
     # Component extraction parameters
     top_p: float = 0.07

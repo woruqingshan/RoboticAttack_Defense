@@ -7,10 +7,7 @@ from .anomaly_detector import (
     DetectionResult,
     PatchAttentionAnomalyDetector,
     # Auto-mode components
-    GridBox,
     PatchAttentionLocalizer,
-    TemporalGate,
-    TemporalGateState,
     DefenseDecision,
     OnlinePatchDefenseController,
     # Unified interface
@@ -20,28 +17,18 @@ from .anomaly_detector import (
 
 from .purifier import ImagePurifier
 
-# New decoupled modules
-from .temporal import (
-    RunningStats2D,
-    Stats2DResult,
-    AttentionStabilityScorer,
-    ROITracker,
-    ROIUpdate,
-    TemporalGate as NewTemporalGate,
-    GateDecision,
-)
-
-from .localizer import (
-    AttentionLocalizer,
-    LocalizeResult,
-)
+from .temporal import GridBox, TemporalGate, GateDecision
 
 from .verifier import (
     CounterfactualVerifier,
+    NoOpVerifier,
     VerifyResult,
+    VerifierProtocol,
     normalized_entropy,
     roi_mass,
 )
+
+from .logging_utils import defense_result_to_log_dict, format_defense_log_line
 
 __all__ = [
     # Sensor
@@ -54,7 +41,6 @@ __all__ = [
     "GridBox",
     "PatchAttentionLocalizer",
     "TemporalGate",
-    "TemporalGateState",
     "DefenseDecision",
     "OnlinePatchDefenseController",
     # Unified interface
@@ -62,20 +48,15 @@ __all__ = [
     "UnifiedDefenseInterface",
     # Purifier
     "ImagePurifier",
-    # New decoupled modules: temporal
-    "RunningStats2D",
-    "Stats2DResult",
-    "AttentionStabilityScorer",
-    "ROITracker",
-    "ROIUpdate",
-    "NewTemporalGate",
     "GateDecision",
-    # New decoupled modules: localizer
-    "AttentionLocalizer",
-    "LocalizeResult",
     # New decoupled modules: verifier
     "CounterfactualVerifier",
+    "NoOpVerifier",
     "VerifyResult",
+    "VerifierProtocol",
     "normalized_entropy",
     "roi_mass",
+    # Logging helpers
+    "defense_result_to_log_dict",
+    "format_defense_log_line",
 ]
