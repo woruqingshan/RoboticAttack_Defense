@@ -52,6 +52,12 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
         "mass_ema",
         "strength",
         "reason",
+        # PRAC fields
+        "prac_performed",
+        "prac_verdict",
+        "prac_odr",
+        "prac_mer",
+        "prac_stats",
     ]:
         base.setdefault(k, None)
 
@@ -82,6 +88,19 @@ def format_defense_log_line(step: int, result: Any) -> str:
         f"verdict={d.get('verdict_code')}",
         f"verified={d.get('verified')}",
     ]
+    
+    # Add PRAC fields if available
+    if d.get("prac_performed"):
+        prac_verdict = d.get("prac_verdict", "N/A")
+        prac_odr = d.get("prac_odr")
+        prac_mer = d.get("prac_mer")
+        prac_str = f"PRAC={prac_verdict}"
+        if prac_odr is not None:
+            prac_str += f",ODR={prac_odr:.3f}"
+        if prac_mer is not None:
+            prac_str += f",MER={prac_mer:.3f}"
+        parts.append(prac_str)
+    
     reason = d.get("reason")
     if isinstance(reason, str) and reason:
         parts.append(f"reason={reason}")

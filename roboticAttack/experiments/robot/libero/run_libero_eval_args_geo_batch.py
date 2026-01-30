@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 run_libero_eval.py
 
@@ -106,6 +107,15 @@ from evaluation_tool.defense import (
     format_defense_log_line,
     defense_result_to_log_dict,
 )
+
+# PRAC checker (optional import)
+try:
+    from evaluation_tool.defense.prac_checker import PRACChecker, PRACConfig
+    PRAC_AVAILABLE = True
+except ImportError:
+    PRACChecker = None
+    PRACConfig = None
+    PRAC_AVAILABLE = False
 
 def _defense_debug_print(cfg, msg: str, log_file=None) -> None:
     """Print defense debug logs when enabled."""
@@ -315,6 +325,21 @@ def eval_libero(cfg) -> None:
             else:
                 verifier = NoOpVerifier()
             
+            # Create PRAC checker if enabled
+            prac_checker = None
+            if PRAC_AVAILABLE and getattr(cfg, "defense_prac_enabled", True):  # Default: enabled if available
+                prac_cfg = PRACConfig(
+                    n_views=getattr(cfg, "defense_prac_n_views", 6),
+                    patch_size=getattr(cfg, "defense_prac_patch_size", 16),
+                    mask_ratio=getattr(cfg, "defense_prac_mask_ratio", 0.25),
+                    transform_mode=getattr(cfg, "defense_prac_transform_mode", "blur"),
+                    tau_odr=getattr(cfg, "defense_prac_tau_odr", 1.8),
+                    tau_mer=getattr(cfg, "defense_prac_tau_mer", 0.20),
+                    max_attempts=getattr(cfg, "defense_prac_max_attempts", 2),
+                    seed=getattr(cfg, "defense_prac_seed", None),
+                )
+                prac_checker = PRACChecker(cfg=prac_cfg)
+            
             controller = OnlinePatchDefenseController(
                 hook=defense_hook,
                 localizer=localizer,
@@ -326,6 +351,8 @@ def eval_libero(cfg) -> None:
                 quality_mass_source=getattr(cfg, "defense_quality_mass_source", "heatmap"),
                 strength_min=getattr(cfg, "defense_strength_min", 0.35),
                 strength_max=getattr(cfg, "defense_strength_max", 0.85),
+                prac_checker=prac_checker,
+                prac_enabled=getattr(cfg, "defense_prac_enabled", True),  # Default: enabled if prac_checker is provided
             )
             defense_interface = UnifiedDefenseInterface(
                 hook=defense_hook,
@@ -647,7 +674,7 @@ def eval_libero(cfg) -> None:
         wandb.save(local_log_filepath)
     # 追加模式打开文件并添加新内容
     with open(os.path.join(cfg.local_log_dir,cfg.task_suite_name+".txt"), "a") as file:
-        file.write(f"success_rate/total:{float(total_successes) / float(total_episodes)}, num_episodes/total:{total_episodes} position_info:{cfg.angle}_{cfg.shx}_{cfg.shy}_{cfg.x}_{cfg.y} \n")  # 在新行添加内容
+        file.write(f"success_rate/total:{float(total_successes) / float(total_episodes)}, num_episodes/total:{total_episodes} position_info:{cfg.angle}_{cfg.shx}_{cfg.shy}_{cfg.x}_{cfg.y} \n")  # 在新行添加内�?
 
 import argparse
 from pathlib import Path
@@ -755,6 +782,16 @@ def parse_args():
     # Controller (quality aligned with heatmap)
     parser.add_argument("--defense_min_trigger_mass_heatmap", type=float, default=0.02, help="Min ROI mass on heatmap to allow trigger (auto mode).")
     parser.add_argument("--defense_quality_mass_source", type=str, default="heatmap", choices=["heatmap", "grid"], help="Mass source for quality gate (auto mode).")
+    # PRAC checker parameters
+    parser.add_argument("--defense_prac_enabled", type=str2bool, default=True, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")
+    parser.add_argument("--defense_prac_n_views", type=int, default=6, help="Number of random views for consensus attention (PRAC).")
+    parser.add_argument("--defense_prac_patch_size", type=int, default=16, help="Patch size for random patch-wise perturbation (PRAC, pixels).")
+    parser.add_argument("--defense_prac_mask_ratio", type=float, default=0.25, help="Fraction of patches to perturb (PRAC, 0-1).")
+    parser.add_argument("--defense_prac_transform_mode", type=str, default="blur", choices=["blur", "gray", "noise"], help="Perturbation mode for patch masking (PRAC).")
+    parser.add_argument("--defense_prac_tau_odr", type=float, default=1.8, help="ODR (Outlier Dependency Ratio) threshold for PRAC verdict (higher = more consistent).")
+    parser.add_argument("--defense_prac_tau_mer", type=float, default=0.20, help="MER (Mainland Erosion Risk) threshold for PRAC verdict (lower = less overlap risk).")
+    parser.add_argument("--defense_prac_max_attempts", type=int, default=2, help="Maximum re-localization attempts within one ACQUIRE frame (PRAC).")
+    parser.add_argument("--defense_prac_seed", type=int, default=None, help="Random seed for PRAC perturbation (None = random).")
 
     args = parser.parse_args()
     return args

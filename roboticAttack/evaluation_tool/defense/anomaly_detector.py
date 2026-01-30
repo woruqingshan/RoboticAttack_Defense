@@ -30,8 +30,16 @@ from .temporal import (
     RunningStats2D,
     TemporalGate,
     GateDecision,
+    grid_iou,
 )
 from .verifier import VerifierProtocol, roi_mass as heatmap_roi_mass
+
+# PRAC checker (optional import to avoid circular dependency)
+try:
+    from .prac_checker import PRACChecker, PRACConfig
+except ImportError:
+    PRACChecker = None
+    PRACConfig = None
 
 if TYPE_CHECKING:  # pragma: no cover
     # Only for type hints; avoid runtime circular imports.
@@ -199,6 +207,19 @@ class PatchAttentionLocalizer:
         else:
             outlier = None
 
+        # Also pad Top-K candidates (if available) for consistent downstream masking.
+        padded_top_k = []
+        raw_top_k = getattr(r, "top_k_candidates", [])
+        if isinstance(raw_top_k, list):
+            for item in raw_top_k:
+                try:
+                    roi_k, score_k = item
+                except Exception:
+                    continue
+                if roi_k is None:
+                    continue
+                padded_top_k.append((_pad_grid_box(roi_k, self.pad_cells, gw=gw, gh=gh), float(score_k)))
+
         # NOTE: we intentionally do not pad the mainland ROI; it is used for debugging
         # and for future verifier/task-preservation checks.
         # Create a new TemporalLocalizeResult with padded outlier_roi, preserving all other fields from r.
@@ -211,6 +232,7 @@ class PatchAttentionLocalizer:
             main_label=r.main_label,
             reason=str(r.reason),
             debug=dict(r.debug) if isinstance(r.debug, dict) else {},
+            top_k_candidates=padded_top_k,
         )
 
 
@@ -243,6 +265,12 @@ class DefenseDecision:
     phase: str = "NA"  # "ACQUIRE" | "TRACK" | "KNOWN" | "NA"
     reacquire_needed: Optional[bool] = None
     verify_performed: Optional[bool] = None
+    # PRAC fields (new)
+    prac_performed: Optional[bool] = None
+    prac_verdict: Optional[str] = None  # "PASS" | "REACQUIRE" | "NEAR_OBJECT" | "SKIP"
+    prac_odr: Optional[float] = None  # Outlier Dependency Ratio
+    prac_mer: Optional[float] = None  # Mainland Erosion Risk
+    prac_stats: Optional[dict] = None  # Full PRAC statistics
 
 
 class OnlinePatchDefenseController:
@@ -278,6 +306,9 @@ class OnlinePatchDefenseController:
         # this threshold is preferred over min_trigger_patch_mass (grid-space).
         min_trigger_mass_heatmap: float = 0.02,
         quality_mass_source: str = "heatmap",  # "heatmap" | "grid"
+        # PRAC checker (optional, plugin)
+        prac_checker: Optional[Any] = None,  # PRACChecker
+        prac_enabled: bool = True,  # Enable PRAC if prac_checker is provided
     ) -> None:
         self.hook = hook
         self.localizer = localizer
@@ -302,12 +333,25 @@ class OnlinePatchDefenseController:
         self.min_trigger_mass_heatmap = float(min_trigger_mass_heatmap)
         self.quality_mass_source = str(quality_mass_source)
 
+        # PRAC checker
+        self.prac_checker = prac_checker
+        self.prac_enabled = bool(prac_enabled) and (prac_checker is not None)
+
         # --- Simplified controller state (ACQUIRE/TRACK) ---
         self._tracking: bool = False
         self._reacquire_needed: bool = True  # start by acquiring an ROI
         self._current_outlier_grid: Optional[GridBox] = None
         self._current_main_grid: Optional[GridBox] = None
         self._current_outlier_score: float = 0.0
+        # PRAC state: protected ROIs for negative prior (avoid re-localizing same region)
+        self._protected_rois: List[GridBox] = []
+
+        # PRAC lock mode (episode scope):
+        # Run localize + PRAC once (first step), lock ROI, then force purify every step.
+        self._locked: bool = False
+        self._locked_outlier_grid: Optional[GridBox] = None
+        self._locked_main_grid: Optional[GridBox] = None
+        self._lock_prac_debug: Optional[dict] = None
 
     def reset(self) -> None:
         self.gate.reset()
@@ -319,6 +363,11 @@ class OnlinePatchDefenseController:
         self._current_outlier_grid = None
         self._current_main_grid = None
         self._current_outlier_score = 0.0
+        self._protected_rois = []
+        self._locked = False
+        self._locked_outlier_grid = None
+        self._locked_main_grid = None
+        self._lock_prac_debug = None
         # Reset localizer temporal state for a new episode.
         if hasattr(self.localizer, "reset"):
             self.localizer.reset()
@@ -362,6 +411,205 @@ class OnlinePatchDefenseController:
         st = self._stats.update(grid)
         stable_grid = st.stable  # long-term high + low variance
 
+        # ---------------------------------------------------------------------
+        # PRAC LOCKED MODE (user requested):
+        # - First step: localize + PRAC over Top-K candidates, pick the best patch ROI, lock it.
+        # - Subsequent steps: always purify the locked ROI (no localize / no PRAC / no gate / no verifier).
+        # ---------------------------------------------------------------------
+        if bool(self._locked) and (self._locked_outlier_grid is not None):
+            roi_grid_locked = self._locked_outlier_grid
+            main_grid_locked = self._locked_main_grid
+            x0, y0, x1, y1 = roi_grid_locked.gx0, roi_grid_locked.gy0, roi_grid_locked.gx1, roi_grid_locked.gy1
+            roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+
+            # Best-effort heatmap mass (for logging only; does not affect decision).
+            mass_heatmap = None
+            if hm_current is not None:
+                try:
+                    mass_heatmap = float(heatmap_roi_mass(hm_current, roi_box))
+                except Exception:
+                    mass_heatmap = None
+            elif heatmap_fn is not None:
+                try:
+                    mass_heatmap = float(heatmap_roi_mass(heatmap_fn(), roi_box))
+                except Exception:
+                    mass_heatmap = None
+
+            return DefenseDecision(
+                should_purify=True,
+                roi_box=roi_box,
+                grid_box=roi_grid_locked,
+                main_grid_box=main_grid_locked,
+                outlier_score=1.0,
+                mass_ema=1.0,
+                raw_mass=1.0,
+                state="LOCKED",
+                reason="locked_force_purify",
+                strength=1.0,  # Full purification strength.
+                verified=None,
+                verify_stats=None,
+                mass_heatmap=mass_heatmap,
+                quality_ok=True,
+                quality_reason="locked_force",
+                gate_checked=False,
+                verdict_code="LOCKED",
+                phase="LOCKED",
+                reacquire_needed=False,
+                verify_performed=False,
+                prac_performed=False,
+                prac_verdict=None,
+                prac_odr=None,
+                prac_mer=None,
+                prac_stats=None,
+            )
+
+        if not bool(self._locked):
+            # One-time ACQUIRE + PRAC lock.
+            tlr = self.localizer.localize(stable_grid)
+            top_k_candidates = getattr(tlr, "top_k_candidates", [])
+            if (not top_k_candidates) and (tlr.outlier_roi is not None):
+                top_k_candidates = [(tlr.outlier_roi, float(tlr.outlier_score))]
+
+            best_roi: Optional[GridBox] = None
+            best_reason: str = "lock_no_candidate"
+            prac_performed: bool = False
+            prac_verdict: Optional[str] = None
+            prac_odr: Optional[float] = None
+            prac_mer: Optional[float] = None
+            prac_stats_dict: Optional[dict] = None
+
+            # If PRAC inputs are available, score each candidate by ROI-masked global shift.
+            if (
+                bool(self.prac_enabled)
+                and (self.prac_checker is not None)
+                and isinstance(top_k_candidates, list)
+                and top_k_candidates
+                and (image is not None)
+                and (forward_fn is not None)
+            ):
+                # Log PRAC execution start
+                print(f"[PRAC_ACQUIRE] Starting PRAC evaluation: top_k_candidates={len(top_k_candidates)}, prac_enabled={self.prac_enabled}, prac_checker={self.prac_checker is not None}")
+                
+                def forward_ctx(img: np.ndarray) -> None:
+                    """Forward context: clear hook and run forward (action discarded)."""
+                    if hasattr(self.hook, "clear"):
+                        self.hook.clear()
+                    forward_fn(img)
+
+                def grid_readout() -> np.ndarray:
+                    """Read attention grid after forward."""
+                    return self.hook.get_saliency_grid()
+
+                scored = []
+                for idx, (candidate_roi, candidate_score) in enumerate(top_k_candidates):
+                    if candidate_roi is None:
+                        continue
+                    # Map candidate ROI to pixel box for ROI-restricted perturbations.
+                    bx0, by0, bx1, by1 = candidate_roi.gx0, candidate_roi.gy0, candidate_roi.gx1, candidate_roi.gy1
+                    pb = self.hook.grid_bbox_to_patch_box(int(bx0), int(by0), int(bx1), int(by1))
+                    roi_box_xyxy = (int(pb.x0), int(pb.y0), int(pb.x1), int(pb.y1))
+
+                    try:
+                        score_obj = self.prac_checker.score_candidate_with_roi_mask(
+                            image=image,
+                            base_grid=grid,
+                            outlier_roi=candidate_roi,
+                            main_roi=tlr.main_roi,
+                            roi_box_xyxy=roi_box_xyxy,
+                            forward_ctx=forward_ctx,
+                            grid_readout=grid_readout,
+                        )
+                        # Log each candidate's PRAC score
+                        print(f"[PRAC_CANDIDATE] candidate_idx={idx}, roi=({candidate_roi.gx0},{candidate_roi.gy0},{candidate_roi.gx1},{candidate_roi.gy1}), "
+                              f"score={score_obj.score:.4f}, drop_rate={score_obj.drop_rate:.4f}, "
+                              f"l1_shift={score_obj.l1_shift:.4f}, base_outlier_mass={score_obj.base_outlier_mass:.4f}")
+                    except Exception as e:
+                        print(f"[PRAC_CANDIDATE] candidate_idx={idx} scoring failed: {e}")
+                        continue
+                    scored.append((score_obj, candidate_roi, float(candidate_score)))
+
+                if scored:
+                    scored.sort(key=lambda t: float(t[0].score), reverse=True)
+                    best_score_obj, best_roi, _ = scored[0]
+                    prac_performed = True
+                    prac_verdict = "LOCK_MAX_DROP"
+                    # Reuse legacy fields for logging without changing the logging schema.
+                    prac_odr = float(best_score_obj.drop_rate)   # logged as "ODR"
+                    prac_mer = float(best_score_obj.l1_shift)    # logged as "MER"
+                    prac_stats_dict = dict(best_score_obj.debug)
+                    best_reason = f"locked_by_prac_drop={best_score_obj.drop_rate:.3f}_l1={best_score_obj.l1_shift:.3f}"
+                    # Log PRAC lock success
+                    print(f"[PRAC_LOCK] prac_performed={prac_performed}, prac_verdict={prac_verdict}, "
+                          f"best_reason={best_reason}, prac_odr={prac_odr:.4f}, prac_mer={prac_mer:.4f}, "
+                          f"selected_roi=({best_roi.gx0},{best_roi.gy0},{best_roi.gx1},{best_roi.gy1}), "
+                          f"scored_candidates={len(scored)}")
+                else:
+                    # PRAC enabled but failed to score; fallback to top-1 candidate.
+                    if top_k_candidates:
+                        best_roi, _ = top_k_candidates[0]
+                        best_reason = "lock_fallback_top1_prac_failed"
+                        print(f"[PRAC_FALLBACK] reason={best_reason}, top_k_count={len(top_k_candidates)}, "
+                              f"scored_count=0 (all candidates failed PRAC scoring)")
+            else:
+                # PRAC disabled or missing inputs; lock top-1 candidate.
+                if isinstance(top_k_candidates, list) and top_k_candidates:
+                    best_roi, _ = top_k_candidates[0]
+                    best_reason = "lock_fallback_top1_prac_disabled"
+                    print(f"[PRAC_FALLBACK] reason={best_reason}, prac_enabled={self.prac_enabled}, "
+                          f"prac_checker={self.prac_checker is not None}, top_k_count={len(top_k_candidates)}, "
+                          f"image={image is not None}, forward_fn={forward_fn is not None}")
+
+            if best_roi is not None:
+                # Lock ROI for the rest of the episode.
+                self._locked = True
+                self._locked_outlier_grid = best_roi
+                self._locked_main_grid = tlr.main_roi
+                self._lock_prac_debug = prac_stats_dict
+
+                # Return the forced purify decision immediately (this step included).
+                x0, y0, x1, y1 = best_roi.gx0, best_roi.gy0, best_roi.gx1, best_roi.gy1
+                roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+
+                mass_heatmap = None
+                if hm_current is not None:
+                    try:
+                        mass_heatmap = float(heatmap_roi_mass(hm_current, roi_box))
+                    except Exception:
+                        mass_heatmap = None
+                elif heatmap_fn is not None:
+                    try:
+                        mass_heatmap = float(heatmap_roi_mass(heatmap_fn(), roi_box))
+                    except Exception:
+                        mass_heatmap = None
+
+                return DefenseDecision(
+                    should_purify=True,
+                    roi_box=roi_box,
+                    grid_box=best_roi,
+                    main_grid_box=tlr.main_roi,
+                    outlier_score=1.0,
+                    mass_ema=1.0,
+                    raw_mass=1.0,
+                    state="LOCKED",
+                    reason=best_reason,
+                    strength=1.0,
+                    verified=None,
+                    verify_stats=None,
+                    mass_heatmap=mass_heatmap,
+                    quality_ok=True,
+                    quality_reason="locked_force",
+                    gate_checked=False,
+                    verdict_code="LOCKED",
+                    phase="LOCKED",
+                    reacquire_needed=False,
+                    verify_performed=False,
+                    prac_performed=prac_performed,
+                    prac_verdict=prac_verdict,
+                    prac_odr=prac_odr,
+                    prac_mer=prac_mer,
+                    prac_stats=prac_stats_dict,
+                )
+
         # --- (B) ACQUIRE/TRACK controller ---
         # ACQUIRE: run localizer only when needed; TRACK: keep using the last ROI.
         main_grid: Optional[GridBox] = self._current_main_grid
@@ -369,16 +617,136 @@ class OnlinePatchDefenseController:
         raw_outlier_score: float = float(self._current_outlier_score)
         loc_reason = "track"
         loc_debug: dict = {}
+        
+        # PRAC state
+        prac_result = None
+        prac_performed = False
+        consensus_grid = None  # Shared consensus grid for Top-K parallel evaluation
 
         if (not bool(self._tracking)) or bool(self._reacquire_needed):
+            # ACQUIRE phase: Top-K parallel PRAC evaluation
+            # Step 1: Localize to get top-K candidates
             tlr = self.localizer.localize(stable_grid)
+            top_k_candidates = getattr(tlr, "top_k_candidates", [])
             main_grid = tlr.main_roi
-            roi_grid = tlr.outlier_roi
-            raw_outlier_score = float(tlr.outlier_score)
-            loc_reason = str(tlr.reason) if hasattr(tlr, "reason") else "ok"
+            
+            # Fallback to top-1 if top_k_candidates is empty
+            if not top_k_candidates and tlr.outlier_roi is not None:
+                top_k_candidates = [(tlr.outlier_roi, float(tlr.outlier_score))]
+            
+            best_roi: Optional[GridBox] = None
+            best_main: Optional[GridBox] = main_grid
+            best_score: float = 0.0
+            best_reason = "no_candidate"
+            best_debug: dict = {}
+            
+            # Step 2: Top-K parallel PRAC evaluation
+            if self.prac_enabled and top_k_candidates and image is not None and forward_fn is not None:
+                # Build forward context (clears hook + forward)
+                def forward_ctx(img: np.ndarray) -> None:
+                    """Forward context: clear hook and run forward."""
+                    if hasattr(self.hook, "clear"):
+                        self.hook.clear()
+                    forward_fn(img)  # Forward pass (action discarded)
+                
+                # Grid readout function
+                def grid_readout() -> np.ndarray:
+                    """Read attention grid after forward."""
+                    return self.hook.get_saliency_grid()
+                
+                # Build consensus attention ONCE (N forwards for all candidates)
+                # Use the first candidate to build consensus (or use original image)
+                consensus_grid = self.prac_checker._build_consensus_attention(
+                    image, forward_ctx, grid_readout
+                )
+                prac_performed = True
+                
+                # Step 3: Evaluate all top-K candidates in parallel (no additional forwards)
+                candidate_results = []
+                for candidate_roi, candidate_score in top_k_candidates:
+                    # Check if candidate overlaps with protected ROIs (negative prior)
+                    overlaps_protected = False
+                    for prot_roi in self._protected_rois:
+                        iou = grid_iou(candidate_roi, prot_roi)
+                        if iou > 0.3:  # Threshold for overlap
+                            overlaps_protected = True
+                            break
+                    
+                    if overlaps_protected:
+                        continue  # Skip protected candidates
+                    
+                    # Evaluate candidate using pre-computed consensus (no forward)
+                    prac_result_candidate = self.prac_checker.evaluate_candidate_with_consensus(
+                        base_grid=grid,
+                        consensus_grid=consensus_grid,
+                        outlier_roi=candidate_roi,
+                        main_roi=main_grid,
+                    )
+                    
+                    candidate_results.append({
+                        "roi": candidate_roi,
+                        "score": candidate_score,
+                        "prac_result": prac_result_candidate,
+                        "odr": prac_result_candidate.stats.odr,
+                        "mer": prac_result_candidate.stats.mer,
+                        "verdict": prac_result_candidate.verdict,
+                    })
+                
+                # Step 4: Select best candidate based on PRAC evaluation
+                if candidate_results:
+                    # Filter: prefer PASS candidates, then by quality score
+                    pass_candidates = [c for c in candidate_results if c["verdict"] == "PASS"]
+                    near_object_candidates = [c for c in candidate_results if c["verdict"] == "NEAR_OBJECT"]
+                    
+                    if pass_candidates:
+                        # Select best PASS candidate: maximize (ODR - lambda * MER)
+                        # Higher ODR = more consistent, lower MER = less overlap risk
+                        lambda_mer = 0.5  # Weight for MER penalty
+                        best_candidate = max(
+                            pass_candidates,
+                            key=lambda c: c["odr"] - lambda_mer * c["mer"]
+                        )
+                        best_roi = best_candidate["roi"]
+                        best_score = best_candidate["score"]
+                        best_reason = f"topk_pass_odr={best_candidate['odr']:.3f}_mer={best_candidate['mer']:.3f}"
+                        prac_result = best_candidate["prac_result"]
+                    elif near_object_candidates:
+                        # All candidates are near object: select one with lowest MER
+                        best_candidate = min(near_object_candidates, key=lambda c: c["mer"])
+                        best_roi = best_candidate["roi"]
+                        best_score = best_candidate["score"]
+                        best_reason = f"topk_near_object_mer={best_candidate['mer']:.3f}"
+                        prac_result = best_candidate["prac_result"]
+                    else:
+                        # All candidates failed PRAC: use fallback (top-1 by localizer score)
+                        # Add failed candidates to protected list for next frame
+                        for c in candidate_results:
+                            if c["prac_result"].protected_roi is not None:
+                                self._protected_rois.append(c["prac_result"].protected_roi)
+                        
+                        # Fallback: use top-1 candidate
+                        if top_k_candidates:
+                            best_roi, best_score = top_k_candidates[0]
+                            best_reason = "topk_fallback_all_failed"
+                else:
+                    # No valid candidates (all protected)
+                    best_reason = "topk_no_valid_candidates"
+            else:
+                # PRAC disabled or missing inputs: use top-1 from localizer
+                if top_k_candidates:
+                    best_roi, best_score = top_k_candidates[0]
+                    best_reason = "topk_prac_disabled"
+                elif tlr.outlier_roi is not None:
+                    best_roi = tlr.outlier_roi
+                    best_score = float(tlr.outlier_score)
+                    best_reason = str(tlr.reason) if hasattr(tlr, "reason") else "ok"
+            
+            # Update controller state with best candidate
+            roi_grid = best_roi
+            raw_outlier_score = best_score
+            loc_reason = best_reason
             loc_debug = dict(tlr.debug) if isinstance(tlr.debug, dict) else {}
-
-            # Update controller state (even if roi_grid is None; we want to drop stale ROIs).
+            
             self._current_main_grid = main_grid
             self._current_outlier_grid = roi_grid
             self._current_outlier_score = float(raw_outlier_score)
@@ -392,6 +760,17 @@ class OnlinePatchDefenseController:
             mass_ema = float(gd0.score_ema)
             state = str(gd0.state)
             greason = str(gd0.reason)
+            # Prepare PRAC fields
+            prac_verdict = None
+            prac_odr = None
+            prac_mer = None
+            prac_stats_dict = None
+            if prac_result is not None:
+                prac_verdict = prac_result.verdict
+                prac_odr = prac_result.stats.odr
+                prac_mer = prac_result.stats.mer
+                prac_stats_dict = prac_result.stats.debug
+            
             return DefenseDecision(
                 should_purify=False,
                 roi_box=None,
@@ -413,6 +792,11 @@ class OnlinePatchDefenseController:
                 phase="ACQUIRE",
                 reacquire_needed=bool(self._reacquire_needed),
                 verify_performed=False,
+                prac_performed=prac_performed,
+                prac_verdict=prac_verdict,
+                prac_odr=prac_odr,
+                prac_mer=prac_mer,
+                prac_stats=prac_stats_dict,
             )
 
         # --- (C0) map ROI grid -> pixel PatchBox early (needed for heatmap-space quality gate) ---
@@ -488,28 +872,44 @@ class OnlinePatchDefenseController:
             if (not bool(should_gate)) or (not bool(allow_trigger)):
                 # Not entering TRACK yet; request reacquire again next frame.
                 self._reacquire_needed = True
-                return DefenseDecision(
-                    should_purify=False,
-                    roi_box=None,
-                    grid_box=None,
-                    main_grid_box=main_grid,
-                    outlier_score=float(score),
-                    mass_ema=float(mass_ema),
-                    raw_mass=float(mass_grid if mass_grid is not None else 0.0),
-                    state=str(state),
-                    reason=f"acquire_not_ready | loc={loc_reason} | {greason}",
-                    strength=None,
-                    verified=None,
-                    verify_stats=None,
-                    mass_heatmap=mass_heatmap,
-                    quality_ok=allow_trigger,
-                    quality_reason=str(quality_reason),
-                    gate_checked=bool(gd.checked),
-                    verdict_code="NA",
-                    phase="ACQUIRE",
-                    reacquire_needed=bool(self._reacquire_needed),
-                    verify_performed=False,
-                )
+            # Prepare PRAC fields
+            prac_verdict = None
+            prac_odr = None
+            prac_mer = None
+            prac_stats_dict = None
+            if prac_result is not None:
+                prac_verdict = prac_result.verdict
+                prac_odr = prac_result.stats.odr
+                prac_mer = prac_result.stats.mer
+                prac_stats_dict = prac_result.stats.debug
+            
+            return DefenseDecision(
+                should_purify=False,
+                roi_box=None,
+                grid_box=None,
+                main_grid_box=main_grid,
+                outlier_score=float(score),
+                mass_ema=float(mass_ema),
+                raw_mass=float(mass_grid if mass_grid is not None else 0.0),
+                state=str(state),
+                reason=f"acquire_not_ready | loc={loc_reason} | {greason}",
+                strength=None,
+                verified=None,
+                verify_stats=None,
+                mass_heatmap=mass_heatmap,
+                quality_ok=allow_trigger,
+                quality_reason=str(quality_reason),
+                gate_checked=bool(gd.checked),
+                verdict_code="NA",
+                phase="ACQUIRE",
+                reacquire_needed=bool(self._reacquire_needed),
+                verify_performed=False,
+                prac_performed=prac_performed,
+                prac_verdict=prac_verdict,
+                prac_odr=prac_odr,
+                prac_mer=prac_mer,
+                prac_stats=prac_stats_dict,
+            )
             # Enter TRACK
             self._tracking = True
 
@@ -566,6 +966,17 @@ class OnlinePatchDefenseController:
         # --- (G) final decision ---
         strength = self._mass_to_strength(float(mass_ema))
 
+        # Prepare PRAC fields
+        prac_verdict = None
+        prac_odr = None
+        prac_mer = None
+        prac_stats_dict = None
+        if prac_result is not None:
+            prac_verdict = prac_result.verdict
+            prac_odr = prac_result.stats.odr
+            prac_mer = prac_result.stats.mer
+            prac_stats_dict = prac_result.stats.debug
+        
         return DefenseDecision(
             # TRACK stage: continuous masking (ignore gate OFF while tracking).
             should_purify=True,
@@ -589,6 +1000,11 @@ class OnlinePatchDefenseController:
             phase="TRACK",
             reacquire_needed=bool(self._reacquire_needed),
             verify_performed=bool(verify_performed),
+            prac_performed=prac_performed,
+            prac_verdict=prac_verdict,
+            prac_odr=prac_odr,
+            prac_mer=prac_mer,
+            prac_stats=prac_stats_dict,
         )
 
 

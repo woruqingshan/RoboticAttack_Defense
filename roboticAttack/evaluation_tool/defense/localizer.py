@@ -202,6 +202,8 @@ class TemporalLocalizeResult:
     main_label: Optional[int]
     reason: str
     debug: Dict[str, Any] = field(default_factory=dict)
+    # Top-K candidates for parallel PRAC evaluation (K=3 by default)
+    top_k_candidates: List[Tuple[GridBox, float]] = field(default_factory=list)  # [(roi, score), ...]
 
 
 def _extract_components(
@@ -366,6 +368,9 @@ class TemporalPatchAttentionLocalizer:
     w_center_penalty: float = 0.6
     w_mainland_iou_penalty: float = 1.0
     center_sigma: float = 0.35  # normalized by diag
+    
+    # Top-K candidates for parallel PRAC evaluation
+    top_k: int = 3
 
     def __post_init__(self) -> None:
         self._tracker = ROITracker(iou_keep=0.30, ema=0.5)
@@ -412,6 +417,7 @@ class TemporalPatchAttentionLocalizer:
                     main_label=self._last_main_label,
                     reason="keepalive_no_components",
                     debug={"miss_left": int(self._miss_left)},
+                    top_k_candidates=[(self._last_roi, float(self._last_score))] if self._last_roi is not None else [],
                 )
             return TemporalLocalizeResult(
                 main_roi=None,
@@ -422,6 +428,7 @@ class TemporalPatchAttentionLocalizer:
                 main_label=None,
                 reason="no_components",
                 debug={},
+                top_k_candidates=[],
             )
 
         mainland = _select_mainland(fc.components, center_box)
@@ -490,6 +497,7 @@ class TemporalPatchAttentionLocalizer:
                 main_label=main_label,
                 reason="no_islands_excluding_mainland",
                 debug={"main_label": main_label},
+                top_k_candidates=[],
             )
 
         candidates.sort(key=lambda t: t[0], reverse=True)
@@ -498,6 +506,8 @@ class TemporalPatchAttentionLocalizer:
         if self._last_roi is not None and self._last_label is not None and best_comp.label != self._last_label:
             if float(best_score) < float(self._last_score) + float(self.switch_margin):
                 self._miss_left = max(0, int(self.keepalive_frames) - 1)
+                # Build top-K candidates from last tracking state
+                top_k_candidates = [(self._last_roi, float(self._last_score))]
                 return TemporalLocalizeResult(
                     main_roi=mainland_roi,
                     outlier_roi=self._last_roi,
@@ -507,6 +517,7 @@ class TemporalPatchAttentionLocalizer:
                     main_label=main_label,
                     reason="winner_keep",
                     debug={"kept_score": float(self._last_score), "new_score": float(best_score)},
+                    top_k_candidates=top_k_candidates,
                 )
 
         upd = self._tracker.update(best_comp.roi)
@@ -517,6 +528,17 @@ class TemporalPatchAttentionLocalizer:
         self._last_label = int(best_comp.label)
         self._last_main_label = main_label
         self._miss_left = int(self.keepalive_frames)
+
+        # Build top-K candidates list: [(GridBox, score), ...]
+        # Use tracker-updated ROI for best candidate, raw ROI for others
+        top_k_candidates = []
+        for idx, (score, comp, feats) in enumerate(candidates[:self.top_k]):
+            if idx == 0:
+                # Best candidate: use tracker-updated ROI
+                top_k_candidates.append((out_roi, float(score)))
+            else:
+                # Other candidates: use raw component ROI
+                top_k_candidates.append((comp.roi, float(score)))
 
         debug = {
             "best": {
@@ -562,5 +584,6 @@ class TemporalPatchAttentionLocalizer:
             main_label=main_label,
             reason="ok",
             debug=debug,
+            top_k_candidates=top_k_candidates,
         )
 
