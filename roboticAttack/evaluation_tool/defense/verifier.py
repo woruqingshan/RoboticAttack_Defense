@@ -1,25 +1,16 @@
 # verifier.py
 # -*- coding: utf-8 -*-
 """
-Counterfactual verification for candidate ROI (V2: three-tier evidence).
+Verification and mask refinement for patch defense.
 
-This module is decoupled and depends only on numpy.
-It uses user-provided callbacks:
-- purify_fn(image, roi_box) -> purified_image
-- forward_fn(purified_image) -> np.ndarray action vector (7-dim)
-- heatmap_fn() -> np.ndarray heatmap (H x W), e.g., 224 x 224
+1) refine_mask_with_constraints (Step 4): Multimodal mask refinement.
+   Given initial_roi_px, G_px, tau_protect, tau_cover, returns a refined (x0,y0,x1,y1)
+   that minimizes overlap with the gripper zone while keeping patch coverage. Used when
+   GripperPrior is available (including NEAR_TASK_PATCH and locked-step refinement).
 
-Main API:
-- CounterfactualVerifier.verify(...)
-
-Three-tier verification:
-1. Tier 1 (Island Suppression): Check if outlier ROI mass drops after purification
-2. Tier 2 (Task Preservation): Check if mainland ROI mass does NOT drop significantly
-3. Tier 3 (Action-level Evidence): Check if policy action changes after purification
-
-Plugin mode:
-- This file also provides a minimal "NoOpVerifier" and an "enabled" switch in CounterfactualVerifier.
-- When disabled, verification is skipped (no extra forward cost) and the verifier returns verdict_code="SKIP".
+2) CounterfactualVerifier: Optional three-tier verification (TRACK stage).
+   - purify_fn, forward_fn, heatmap_fn; Tier 1 (island suppression), Tier 2 (task
+     preservation), Tier 3 (action change). NoOpVerifier and enabled=False skip work.
 """
 
 from __future__ import annotations
@@ -38,6 +29,103 @@ def _as_xyxy(box: BoxLike) -> Tuple[int, int, int, int]:
         return int(x0), int(y0), int(x1), int(y1)
     # object with attributes
     return int(box.x0), int(box.y0), int(box.x1), int(box.y1)
+
+
+def refine_mask_with_constraints(
+    initial_roi_px: BoxLike,
+    G_px: BoxLike,
+    tau_protect: float,
+    tau_cover: float,
+) -> Tuple[int, int, int, int]:
+    """
+    Refines the mask ROI to minimize overlap with the gripper/task area (G_px)
+    while maintaining sufficient coverage of the initial patch ROI.
+    
+    Args:
+        initial_roi_px: The original patch bounding box.
+        G_px: The geometric protection zone for the gripper/task.
+        tau_protect: Maximum allowed overlap ratio with G_px.
+        tau_cover: Minimum required coverage ratio of the original ROI.
+        
+    Returns:
+        (x0, y0, x1, y1) representing the refined mask box.
+    """
+    rx0, ry0, rx1, ry1 = _as_xyxy(initial_roi_px)
+    gx0, gy0, gx1, gy1 = _as_xyxy(G_px)
+
+    def area(x0: int, y0: int, x1: int, y1: int) -> int:
+        return max(0, x1 - x0) * max(0, y1 - y0)
+
+    def intersect_area(a_x0: int, a_y0: int, a_x1: int, a_y1: int, b_x0: int, b_y0: int, b_x1: int, b_y1: int) -> int:
+        ix0 = max(a_x0, b_x0)
+        iy0 = max(a_y0, b_y0)
+        ix1 = min(a_x1, b_x1)
+        iy1 = min(a_y1, b_y1)
+        return area(ix0, iy0, ix1, iy1)
+
+    initial_area = area(rx0, ry0, rx1, ry1)
+    if initial_area == 0:
+        return (rx0, ry0, rx1, ry1)
+
+    G_area = area(gx0, gy0, gx1, gy1)
+    if G_area == 0:
+        return (rx0, ry0, rx1, ry1)
+
+    # Generate candidate boxes by shrinking the initial ROI from each side
+    candidates = []
+    
+    # 0. Original
+    candidates.append((rx0, ry0, rx1, ry1))
+    
+    # 1. Shrink left side (move rx0 to gx1)
+    if rx0 < gx1 < rx1:
+        candidates.append((gx1, ry0, rx1, ry1))
+    # 2. Shrink right side (move rx1 to gx0)
+    if rx0 < gx0 < rx1:
+        candidates.append((rx0, ry0, gx0, ry1))
+    # 3. Shrink top side (move ry0 to gy1)
+    if ry0 < gy1 < ry1:
+        candidates.append((rx0, gy1, rx1, ry1))
+    # 4. Shrink bottom side (move ry1 to gy0)
+    if ry0 < gy0 < ry1:
+        candidates.append((rx0, ry0, rx1, gy0))
+
+    # Evaluate candidates
+    best_cand = None
+    best_overlap_G = float('inf')
+    best_cover = 0.0
+
+    valid_cands = []
+    for cand in candidates:
+        cx0, cy0, cx1, cy1 = cand
+        cand_area = area(cx0, cy0, cx1, cy1)
+        if cand_area == 0:
+            continue
+            
+        over_g = intersect_area(cx0, cy0, cx1, cy1, gx0, gy0, gx1, gy1) / G_area
+        cover_p = intersect_area(cx0, cy0, cx1, cy1, rx0, ry0, rx1, ry1) / initial_area
+        
+        valid_cands.append((cand, over_g, cover_p))
+        
+        if over_g <= tau_protect and cover_p >= tau_cover:
+            # Prefer minimal overlap with G. Tie-break by maximum coverage.
+            if best_cand is None or over_g < best_overlap_G or (abs(over_g - best_overlap_G) < 1e-5 and cover_p > best_cover):
+                best_cand = cand
+                best_overlap_G = over_g
+                best_cover = cover_p
+                
+    if best_cand is not None:
+        return best_cand
+        
+    # Fallback: if no candidate strictly satisfies both constraints, 
+    # prioritize protecting G (minimize over_g), but require SOME coverage (e.g., > 0.1).
+    valid_cands.sort(key=lambda x: (x[1], -x[2]))  # sort by overlap_G (asc), then cover_p (desc)
+    for cand, over_g, cover_p in valid_cands:
+        if cover_p >= 0.1:
+            return cand
+            
+    # Absolute fallback: return original
+    return (rx0, ry0, rx1, ry1)
 
 
 def normalized_entropy(hm: np.ndarray, eps: float = 1e-8) -> float:

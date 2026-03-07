@@ -1,21 +1,14 @@
 # localizer.py
 # -*- coding: utf-8 -*-
 """
-ROI localizer for stable attention grids.
+Step 1: ROI localizer for stable attention grids.
 
-This module is decoupled and depends only on numpy.
-It provides connected-component localization on a thresholded stable grid.
-
-Main API:
+Decoupled, numpy-only. Connected-component localization on a thresholded stable grid.
 - TemporalPatchAttentionLocalizer.localize(stable_grid) -> TemporalLocalizeResult
+  (main_roi, outlier_roi, top_k_candidates). Used by the controller before PatchSelector.
 
-Design note:
-- This module ONLY localizes and scores candidate regions on a (stable) attention grid.
-- It must NOT implement temporal gating (HOLD/COOLDOWN), purification, or verification.
-
-Backward compatibility:
-- AttentionLocalizer/LocalizeResult are kept as legacy utilities. New code should prefer
-  TemporalPatchAttentionLocalizer/TemporalLocalizeResult.
+This module only localizes and scores candidates; no gating, purification, or verification.
+Legacy: AttentionLocalizer/LocalizeResult kept; prefer TemporalPatchAttentionLocalizer/TemporalLocalizeResult.
 """
 
 from __future__ import annotations

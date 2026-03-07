@@ -1,4 +1,9 @@
-"""Image purification utilities for online patch defense."""
+"""Image purification for online patch defense.
+
+Applies the chosen strategy (mask_mean, mask_gray, blend_*, blur) to the ROI given by
+the controller (PatchBox). Used after the defense step returns should_purify and roi_box
+(possibly refined by Step 4). Pure NumPy + optional OpenCV.
+"""
 
 from __future__ import annotations
 

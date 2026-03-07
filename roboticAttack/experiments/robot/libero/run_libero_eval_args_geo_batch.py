@@ -106,6 +106,11 @@ from evaluation_tool.defense import (
     NoOpVerifier,
     format_defense_log_line,
     defense_result_to_log_dict,
+    # Multimodal geometry prior components
+    GripperPrior,
+    GripperPriorConfig,
+    PatchSelector,
+    PatchSelectorConfig,
 )
 
 # PRAC checker (optional import)
@@ -159,17 +164,33 @@ def _make_overlay_rgb(image_rgb, heatmap, alpha: float):
         hm_u8 = _normalize_heatmap_uint8(heatmap)
         return np.stack([hm_u8, hm_u8, hm_u8], axis=-1)
 
-def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"]):
+def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"], gripper_box=None):
     """Optionally concatenate the policy input and heatmap overlay side-by-side."""
+    # If a gripper box is provided, draw it on the image_rgb (and overlay if created)
+    img_to_pack = image_rgb.copy()
+    if gripper_box is not None:
+        try:
+            import cv2
+            # Draw a green bounding box for the gripper prior
+            cv2.rectangle(
+                img_to_pack, 
+                (int(gripper_box.x0), int(gripper_box.y0)), 
+                (int(gripper_box.x1), int(gripper_box.y1)), 
+                (0, 255, 0), 2
+            )
+        except Exception:
+            pass
+
     if not getattr(cfg, "defense_viz", False):
-        return image_rgb
+        return img_to_pack
     if heatmap is None:
-        return image_rgb
-    overlay = _make_overlay_rgb(image_rgb, heatmap, alpha=getattr(cfg, "defense_viz_alpha", 0.45))
+        return img_to_pack
+        
+    overlay = _make_overlay_rgb(img_to_pack, heatmap, alpha=getattr(cfg, "defense_viz_alpha", 0.45))
     try:
-        return np.concatenate([image_rgb, overlay], axis=1)
+        return np.concatenate([img_to_pack, overlay], axis=1)
     except Exception:
-        return image_rgb
+        return img_to_pack
 
 
 # @dataclass
@@ -325,7 +346,7 @@ def eval_libero(cfg) -> None:
             else:
                 verifier = NoOpVerifier()
             
-            # Create PRAC checker if enabled
+            # Create PRAC checker if enabled (kept for fallback)
             prac_checker = None
             if PRAC_AVAILABLE and getattr(cfg, "defense_prac_enabled", True):  # Default: enabled if available
                 prac_cfg = PRACConfig(
@@ -340,6 +361,21 @@ def eval_libero(cfg) -> None:
                 )
                 prac_checker = PRACChecker(cfg=prac_cfg)
             
+            # Create Multimodal prior components if enabled
+            gripper_prior = None
+            patch_selector = None
+            if getattr(cfg, "defense_gripper_prior_enabled", True):
+                gp_cfg = GripperPriorConfig(
+                    radius_px=getattr(cfg, "defense_gripper_radius_px", 40)
+                )
+                gripper_prior = GripperPrior(gp_cfg)
+                
+                ps_cfg = PatchSelectorConfig(
+                    tau_g=getattr(cfg, "defense_tau_g", 0.3),
+                    tau_patch_strength=getattr(cfg, "defense_tau_patch_strength", 0.05)
+                )
+                patch_selector = PatchSelector(ps_cfg)
+
             controller = OnlinePatchDefenseController(
                 hook=defense_hook,
                 localizer=localizer,
@@ -353,6 +389,10 @@ def eval_libero(cfg) -> None:
                 strength_max=getattr(cfg, "defense_strength_max", 0.85),
                 prac_checker=prac_checker,
                 prac_enabled=getattr(cfg, "defense_prac_enabled", True),  # Default: enabled if prac_checker is provided
+                gripper_prior=gripper_prior,
+                patch_selector=patch_selector,
+                tau_protect=getattr(cfg, "defense_tau_protect", 0.1),
+                tau_cover=getattr(cfg, "defense_tau_cover", 0.5),
             )
             defense_interface = UnifiedDefenseInterface(
                 hook=defense_hook,
@@ -505,8 +545,15 @@ def eval_libero(cfg) -> None:
 
                     # Unified defense step (works for both known and auto modes)
                     heatmap_for_viz = None
+                    gripper_box_for_viz = None
                     if defense_interface is not None:
                         try:
+                            # Extract EEF pos for Multimodal Geometric Prior
+                            # We concatenate pos, quat (as axis-angle), and gripper qpos
+                            eef_pos = np.concatenate(
+                                (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+                            )
+
                             # For auto mode, pass additional parameters
                             if defense_mode == "auto":
                                 defense_result = defense_interface.step(
@@ -514,15 +561,14 @@ def eval_libero(cfg) -> None:
                                     purify_fn=lambda img, box: defense_purifier.purify(img, box),
                                     forward_fn=lambda img: get_action(cfg, model, {
                                         "full_image": img,
-                                        "state": np.concatenate(
-                                            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-                                        ),
+                                        "state": eef_pos,
                                     }, task_description, processor=processor),
                                     heatmap_fn=lambda: defense_hook.get_heatmap(),
                                     hm_current=defense_hook.get_heatmap(),
+                                    eef_pos=eef_pos,
                                 )
                             else:
-                                defense_result = defense_interface.step()
+                                defense_result = defense_interface.step(eef_pos=eef_pos)
                         except Exception as defense_error:
                             # Exit immediately on defense errors to avoid empty episode analysis
                             error_msg = f"FATAL DEFENSE ERROR: {defense_error}"
@@ -532,9 +578,10 @@ def eval_libero(cfg) -> None:
                             log_file.close()
                             sys.exit(1)
                         
-                        # Get heatmap for visualization
+                        # Get heatmap and gripper box for visualization
                         if getattr(cfg, "defense_viz", False):
                             heatmap_for_viz = defense_result.heatmap
+                            gripper_box_for_viz = getattr(defense_result, "gripper_box", None)
                         
                         # Statistics (new semantics)
                         dlog = defense_result_to_log_dict(defense_result)
@@ -585,7 +632,7 @@ def eval_libero(cfg) -> None:
                     # Save replay frame:
                     # - default: policy input image
                     # - optional: side-by-side with real-time heatmap overlay
-                    replay_images.append(_maybe_pack_replay_frame(cfg, img_for_policy, heatmap_for_viz))
+                    replay_images.append(_maybe_pack_replay_frame(cfg, img_for_policy, heatmap_for_viz, gripper_box_for_viz))
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -672,9 +719,9 @@ def eval_libero(cfg) -> None:
             }
         )
         wandb.save(local_log_filepath)
-    # 追加模式打开文件并添加新内容
+    # ?????????????????????
     with open(os.path.join(cfg.local_log_dir,cfg.task_suite_name+".txt"), "a") as file:
-        file.write(f"success_rate/total:{float(total_successes) / float(total_episodes)}, num_episodes/total:{total_episodes} position_info:{cfg.angle}_{cfg.shx}_{cfg.shy}_{cfg.x}_{cfg.y} \n")  # 在新行添加内�?
+        file.write(f"success_rate/total:{float(total_successes) / float(total_episodes)}, num_episodes/total:{total_episodes} position_info:{cfg.angle}_{cfg.shx}_{cfg.shy}_{cfg.x}_{cfg.y} \n")  # ???????????
 
 import argparse
 from pathlib import Path
@@ -782,6 +829,15 @@ def parse_args():
     # Controller (quality aligned with heatmap)
     parser.add_argument("--defense_min_trigger_mass_heatmap", type=float, default=0.02, help="Min ROI mass on heatmap to allow trigger (auto mode).")
     parser.add_argument("--defense_quality_mass_source", type=str, default="heatmap", choices=["heatmap", "grid"], help="Mass source for quality gate (auto mode).")
+    
+    # Multimodal Gripper Prior & Patch Selector parameters
+    parser.add_argument("--defense_gripper_prior_enabled", type=str2bool, default=True, help="Enable multimodal geometric gripper prior.")
+    parser.add_argument("--defense_gripper_radius_px", type=int, default=40, help="Radius in pixels for the gripper protection zone.")
+    parser.add_argument("--defense_tau_g", type=float, default=0.3, help="Overlap threshold with GripperPrior for PatchSelector.")
+    parser.add_argument("--defense_tau_patch_strength", type=float, default=0.05, help="Minimum anomaly mass for PatchSelector.")
+    parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
+    parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
+
     # PRAC checker parameters
     parser.add_argument("--defense_prac_enabled", type=str2bool, default=True, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")
     parser.add_argument("--defense_prac_n_views", type=int, default=6, help="Number of random views for consensus attention (PRAC).")

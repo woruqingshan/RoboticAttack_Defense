@@ -1,16 +1,13 @@
 # temporal.py
 # -*- coding: utf-8 -*-
 """
-Temporal utilities for online patch defense.
+Temporal and grid utilities for online patch defense.
 
-This module is intentionally decoupled from the rest of the project.
-It only depends on numpy.
-
-Key components:
-- RunningStats2D: EMA mean/variance + stable score for 2D grids
-- AttentionStabilityScorer: computes ROI mass score on stable grids
-- ROITracker: smooth ROI updates to reduce jitter
-- TemporalGate: minimal hysteresis gate (continuous ON/OFF; no HOLD/COOLDOWN pulse)
+Decoupled, numpy-only. Used by the full pipeline (stable grid, gating, geometry).
+- RunningStats2D: EMA mean/variance + stable grid for localizer input.
+- GridBox: axis-aligned bbox in grid coords; grid_iou(a, b) for PatchSelector overlap.
+- TemporalGate: minimal hysteresis gate (ON/OFF) for legacy TRACK path.
+- ROITracker / AttentionStabilityScorer: optional smoothing and scoring.
 """
 
 from __future__ import annotations

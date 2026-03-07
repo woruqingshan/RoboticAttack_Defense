@@ -1,4 +1,9 @@
-"""Online attention hook + heatmap extraction for patch defense."""
+"""Online attention hook and heatmap extraction for patch defense.
+
+Provides saliency grid and heatmap from the model forward pass, and grid-to-pixel
+bbox conversion. Used by the controller for Step 1 (localizer input), Step 4 (mask
+in pixel coords), and visualization (G_px, ROI overlay).
+"""
 
 from __future__ import annotations
 

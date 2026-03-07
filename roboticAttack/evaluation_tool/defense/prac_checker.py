@@ -3,6 +3,9 @@
 """
 PRAC (Patch-wise Randomized Attention Consistency) Checker.
 
+Note: The main defense pipeline uses GripperPrior + PatchSelector and does not call
+this module. This file is kept for reference or fallback use only.
+
 This module implements perception-level check to distinguish patch-induced anomalies
 from task-semantic attention using randomized patch-wise perturbations.
 
@@ -22,7 +25,7 @@ Integration:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Callable, Literal, Dict, Any, Tuple, List
+from typing import Optional, Callable, Literal, Dict, Any, Tuple, List, Union
 import numpy as np
 
 from .temporal import GridBox
@@ -84,6 +87,25 @@ class PRACConfig:
     use_dynamic_mask_ratio: bool = True
     mask_ratio_min: float = 0.1
     mask_ratio_max: float = 0.3
+    
+    # =============================================================================
+    # Phase 2 optimization parameters
+    # =============================================================================
+    
+    # Weighted consensus aggregation (Phase 2.1)
+    use_weighted_consensus: bool = True
+    weight_strength_factor: float = 1.0  # Weight for perturbation strength
+    weight_change_factor: float = 1.0    # Weight for attention change magnitude
+    weight_consistency_factor: float = 1.0  # Weight for view consistency
+    
+    # Enhanced scoring (Phase 2.2)
+    use_enhanced_scoring: bool = True
+    enhanced_score_high_drop_weight: Tuple[float, float, float] = (0.7, 0.2, 0.1)  # (drop, l1, main) when drop_rate > 0.5
+    enhanced_score_medium_drop_weight: Tuple[float, float, float] = (0.5, 0.35, 0.15)  # when 0.2 < drop_rate <= 0.5
+    enhanced_score_low_drop_weight: Tuple[float, float, float] = (0.3, 0.5, 0.2)  # when drop_rate <= 0.2
+    
+    # Enhanced logging (Phase 2.5)
+    enable_detailed_logging: bool = True
 
 
 @dataclass
@@ -463,12 +485,21 @@ class PRACChecker:
         base_outlier_mass = float(self._roi_mass_in_grid(base_grid, outlier_roi_g))
         base_main_mass = float(self._roi_mass_in_grid(base_grid, main_roi_g)) if main_roi_g is not None else 0.0
 
-        consensus_grid = self._build_consensus_attention_in_box(
+        # Phase 2: Build consensus with weighted aggregation (if enabled)
+        consensus_result = self._build_consensus_attention_in_box(
             image=image,
             roi_box_xyxy=roi_box_xyxy,
             forward_ctx=forward_ctx,
             grid_readout=grid_readout,
+            base_grid=base_grid,  # Phase 2: for weighted consensus
         )
+        
+        # Handle return value: (consensus_grid, weights) or just consensus_grid (backward compatibility)
+        if isinstance(consensus_result, tuple):
+            consensus_grid, consensus_weights = consensus_result
+        else:
+            consensus_grid = consensus_result
+            consensus_weights = None
 
         cons_outlier_mass = float(self._roi_mass_in_grid(consensus_grid, outlier_roi_g))
         cons_main_mass = float(self._roi_mass_in_grid(consensus_grid, main_roi_g)) if main_roi_g is not None else 0.0
@@ -489,9 +520,19 @@ class PRACChecker:
         q = self._normalize_grid(consensus_grid)
         l1_shift = float(np.abs(p - q).sum())
 
-        # Final score: use drop_rate as the primary ranking key (threshold-free).
-        score = float(drop_rate)
+        # Phase 2: Enhanced scoring (combine multiple signals)
+        if self.cfg.use_enhanced_scoring:
+            score = self._compute_enhanced_score(
+                drop_rate=drop_rate,
+                l1_shift=l1_shift,
+                main_rise=main_rise,
+                base_outlier_mass=base_outlier_mass,
+            )
+        else:
+            # Fallback to Phase 1 behavior: use drop_rate as the primary ranking key
+            score = float(drop_rate)
 
+        # Phase 2: Enhanced debug information
         debug = {
             "base_outlier_mass": float(base_outlier_mass),
             "cons_outlier_mass": float(cons_outlier_mass),
@@ -501,6 +542,27 @@ class PRACChecker:
             "main_rise": float(main_rise),
             "l1_shift": float(l1_shift),
         }
+        
+        # Phase 2: Add weighted consensus and enhanced scoring debug info
+        if consensus_weights is not None:
+            debug["consensus_weights"] = consensus_weights
+            debug["consensus_weight_std"] = float(np.std(consensus_weights)) if len(consensus_weights) > 1 else 0.0
+            debug["consensus_weight_min"] = float(np.min(consensus_weights)) if consensus_weights else 0.0
+            debug["consensus_weight_max"] = float(np.max(consensus_weights)) if consensus_weights else 0.0
+        
+        if self.cfg.use_enhanced_scoring:
+            # Add normalized components for debugging
+            drop_rate_norm = np.clip(drop_rate, 0.0, 1.0)
+            l1_shift_norm = np.clip(l1_shift / 2.0, 0.0, 1.0)
+            main_rise_norm = np.clip(main_rise / (base_outlier_mass + eps), 0.0, 1.0) if base_outlier_mass > eps else 0.0
+            debug["drop_rate_norm"] = float(drop_rate_norm)
+            debug["l1_shift_norm"] = float(l1_shift_norm)
+            debug["main_rise_norm"] = float(main_rise_norm)
+            debug["enhanced_score_components"] = {
+                "drop_rate": float(drop_rate_norm),
+                "l1_shift": float(l1_shift_norm),
+                "main_rise": float(main_rise_norm),
+            }
 
         return PRACCandidateScore(
             score=float(score),
@@ -521,23 +583,121 @@ class PRACChecker:
         roi_box_xyxy: Tuple[int, int, int, int],
         forward_ctx: Callable[[np.ndarray], None],
         grid_readout: Callable[[], np.ndarray],
-    ) -> np.ndarray:
+        base_grid: Optional[np.ndarray] = None,  # Phase 2: for weighted consensus
+    ) -> Tuple[np.ndarray, Optional[List[float]]]:
         """Build consensus attention from N views by perturbing only inside a given pixel ROI box.
         
         RPA-based optimizations: passes view_idx to enable multi-scale, mixed transform, and dynamic mask_ratio.
+        Phase 2: supports weighted consensus aggregation.
+        
+        Returns:
+            consensus_grid: Aggregated attention grid (16x16)
+            weights: List of weights for each view (if weighted consensus enabled, None otherwise)
         """
         grids: List[np.ndarray] = []
+        view_configs: List[Dict[str, Any]] = []  # Phase 2: record view configurations for weighting
+        
         for i in range(int(self.cfg.n_views)):
-            # Pass view_idx to enable RPA optimizations (multi-scale, mixed transform, dynamic mask_ratio)
-            perturbed = self._apply_patch_perturbation_in_box(
-                image.copy(), 
-                roi_box_xyxy=roi_box_xyxy,
-                view_idx=i  # Pass view index for alternating patch sizes
-            )
+            # Phase 2: Get actual view configuration during perturbation
+            if self.cfg.use_weighted_consensus:
+                # Request configuration to be returned
+                perturbed_result = self._apply_patch_perturbation_in_box(
+                    image.copy(), 
+                    roi_box_xyxy=roi_box_xyxy,
+                    view_idx=i,
+                    return_config=True,  # Phase 2: request configuration
+                )
+                perturbed, actual_config = perturbed_result
+                view_configs.append(actual_config)
+            else:
+                # Phase 1 behavior: no configuration needed
+                perturbed = self._apply_patch_perturbation_in_box(
+                    image.copy(), 
+                    roi_box_xyxy=roi_box_xyxy,
+                    view_idx=i,
+                    return_config=False,
+                )
+            
             forward_ctx(perturbed)
-            grids.append(grid_readout())
-        stacked = np.stack(grids, axis=0)
-        return np.mean(stacked, axis=0).astype(np.float32)
+            grid_i = grid_readout()
+            grids.append(grid_i)
+        
+        stacked = np.stack(grids, axis=0)  # [N, H, W]
+        
+        # Phase 2: Weighted consensus aggregation
+        if self.cfg.use_weighted_consensus and base_grid is not None and view_configs:
+            consensus, weights = self._compute_weighted_consensus(
+                grids=grids,
+                base_grid=base_grid,
+                view_configs=view_configs,
+            )
+            return consensus, weights
+        else:
+            # Fallback to simple mean (Phase 1 behavior)
+            consensus = np.mean(stacked, axis=0).astype(np.float32)
+            return consensus, None
+    
+    def _compute_weighted_consensus(
+        self,
+        grids: List[np.ndarray],
+        base_grid: np.ndarray,
+        view_configs: List[Dict[str, Any]],
+    ) -> Tuple[np.ndarray, List[float]]:
+        """Compute weighted consensus attention from multiple views (Phase 2.1).
+        
+        Args:
+            grids: List of attention grids from N views
+            base_grid: Base attention grid (for computing change magnitude)
+            view_configs: List of view configurations (patch_size, mask_ratio, transform_mode)
+        
+        Returns:
+            consensus: Weighted consensus attention grid
+            weights: List of weights for each view
+        """
+        weights = []
+        eps = 1e-8
+        
+        for i, (grid_i, config_i) in enumerate(zip(grids, view_configs)):
+            # Weight 1: Perturbation strength (larger patches + higher mask_ratio = more reliable)
+            strength_weight = float(config_i['patch_size']) * float(config_i['mask_ratio'])
+            strength_weight = strength_weight * self.cfg.weight_strength_factor
+            
+            # Weight 2: Attention change magnitude (larger change = more informative)
+            change_magnitude = float(np.abs(grid_i - base_grid).sum())
+            base_magnitude = float(np.abs(base_grid).sum())
+            change_weight = change_magnitude / (base_magnitude + eps)
+            change_weight = change_weight * self.cfg.weight_change_factor
+            
+            # Weight 3: Consistency with other views (higher consistency = more reliable)
+            consistency_scores = []
+            for j, grid_j in enumerate(grids):
+                if i != j:
+                    consistency_scores.append(float(np.abs(grid_i - grid_j).sum()))
+            if consistency_scores:
+                consistency_std = float(np.std(consistency_scores))
+                consistency_weight = 1.0 / (1.0 + consistency_std)
+            else:
+                consistency_weight = 1.0
+            consistency_weight = consistency_weight * self.cfg.weight_consistency_factor
+            
+            # Combined weight (product of normalized components)
+            combined_weight = strength_weight * change_weight * consistency_weight
+            weights.append(combined_weight)
+        
+        # Normalize weights
+        weights = np.array(weights, dtype=np.float32)
+        weight_sum = weights.sum()
+        if weight_sum > eps:
+            weights = weights / weight_sum
+        else:
+            # Fallback to uniform weights if all weights are too small
+            weights = np.ones(len(grids), dtype=np.float32) / len(grids)
+        
+        # Weighted consensus
+        stacked = np.stack(grids, axis=0)  # [N, H, W]
+        consensus = np.average(stacked, axis=0, weights=weights).astype(np.float32)
+        
+        return consensus, weights.tolist()
 
     def _apply_patch_perturbation_in_box(
         self,
@@ -545,7 +705,8 @@ class PRACChecker:
         *,
         roi_box_xyxy: Tuple[int, int, int, int],
         view_idx: int = 0,
-    ) -> np.ndarray:
+        return_config: bool = False,  # Phase 2: optionally return configuration
+    ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
         """Apply randomized patch-wise perturbations *restricted to the given ROI box* (pixel space).
         
         RPA-based optimizations (Phase 1):
@@ -566,6 +727,8 @@ class PRACChecker:
         y0 = int(max(0, min(int(y0), h)))
         y1 = int(max(0, min(int(y1), h)))
         if x1 <= x0 or y1 <= y0:
+            if return_config:
+                return image, {'patch_size': self.cfg.patch_size, 'mask_ratio': self.cfg.mask_ratio, 'transform_mode': self.cfg.transform_mode}
             return image
 
         # =============================================================================
@@ -599,6 +762,8 @@ class PRACChecker:
                 roi_patch_indices.append((ph, pw))
 
         if not roi_patch_indices:
+            if return_config:
+                return image, {'patch_size': patch_size, 'mask_ratio': 0.0, 'transform_mode': self.cfg.transform_mode}
             return image
 
         # =============================================================================
@@ -649,8 +814,65 @@ class PRACChecker:
                 noise = self._rng.normal(0, float(self.cfg.noise_std) * 255.0, patch_roi.shape)
                 patch_roi[:] = np.clip(patch_roi.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
+        # Phase 2: Return configuration if requested
+        if return_config:
+            config = {
+                'patch_size': patch_size,
+                'mask_ratio': mask_ratio,
+                'transform_mode': transform_mode,
+            }
+            return image, config
+        
         return image
 
+    def _compute_enhanced_score(
+        self,
+        drop_rate: float,
+        l1_shift: float,
+        main_rise: float,
+        base_outlier_mass: float,
+    ) -> float:
+        """Compute enhanced score combining multiple signals (Phase 2.2).
+        
+        Args:
+            drop_rate: Attention drop rate on candidate ROI
+            l1_shift: Global attention distribution shift (L1 norm)
+            main_rise: Mainland attention rise
+            base_outlier_mass: Base outlier mass (for normalization)
+        
+        Returns:
+            Enhanced score combining drop_rate, l1_shift, and main_rise
+        """
+        eps = 1e-8
+        
+        # Normalize metrics to [0, 1] range
+        drop_rate_norm = np.clip(drop_rate, 0.0, 1.0)
+        
+        # L1 shift normalization: typically in [0, 2] for normalized grids
+        l1_shift_norm = np.clip(l1_shift / 2.0, 0.0, 1.0)
+        
+        # Main rise normalization: relative to base_outlier_mass
+        if base_outlier_mass > eps:
+            main_rise_norm = np.clip(main_rise / base_outlier_mass, 0.0, 1.0)
+        else:
+            main_rise_norm = 0.0
+        
+        # Adaptive weights based on signal strength
+        if drop_rate > 0.5:
+            # High confidence: drop_rate is the primary signal
+            w_drop, w_l1, w_main = self.cfg.enhanced_score_high_drop_weight
+        elif drop_rate > 0.2:
+            # Medium confidence: balance between drop_rate and l1_shift
+            w_drop, w_l1, w_main = self.cfg.enhanced_score_medium_drop_weight
+        else:
+            # Low confidence: rely more on l1_shift and main_rise
+            w_drop, w_l1, w_main = self.cfg.enhanced_score_low_drop_weight
+        
+        # Combined score
+        score = w_drop * drop_rate_norm + w_l1 * l1_shift_norm + w_main * main_rise_norm
+        
+        return float(score)
+    
     @staticmethod
     def _normalize_grid(grid: np.ndarray) -> np.ndarray:
         """Normalize a grid to a probability distribution (sum=1) in float32."""

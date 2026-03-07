@@ -1,19 +1,28 @@
 """
-Anomaly detection + localization + temporal gating for attention-based patch defense.
+Anomaly detection + localization + controller for attention-based patch defense.
 
-This module keeps the legacy detector API:
-    PatchAttentionAnomalyDetector.detect(heatmap, patch_box) -> DetectionResult
+This module provides:
 
-And extends the system with:
-- PatchAttentionLocalizer: localize suspicious ROI from a low-res saliency grid
-- TemporalGate: minimal ON/OFF hysteresis gate (continuous masking)
-- OnlinePatchDefenseController: localize + gate -> pixel ROI decision
-- UnifiedDefenseInterface: one-step interface (known/oracle vs auto/localize modes)
+Legacy API (known patch location):
+- PatchAttentionAnomalyDetector.detect(heatmap, patch_box) -> DetectionResult
+
+Auto-mode pipeline (multimodal geometric prior + PatchSelector, no PRAC in main path):
+- Step 0: GripperPrior (optional) yields G_px, G_grid from eef_pos.
+- Step 1: PatchAttentionLocalizer on stable grid -> main_roi + top_k outlier candidates.
+- Step 2: PatchSelector filters by G_grid overlap and tau_patch_strength; outputs
+  NO_PATCH | PATCH_FOUND | NEAR_TASK_PATCH and selected ROI.
+- Step 3: Gate by verdict (NO_PATCH -> no purify; PATCH_FOUND/NEAR_TASK_PATCH -> lock ROI).
+- Step 4: Mask refinement via verifier.refine_mask_with_constraints(roi, G_px, tau_protect, tau_cover).
+- Step 5: ACQUIRE/TRACK; locked ROI is purified every step; optional counterfactual verifier on TRACK.
+
+Key types:
+- PatchAttentionLocalizer, TemporalGate, OnlinePatchDefenseController (optional GripperPrior, PatchSelector).
+- DefenseDecision (should_purify, roi_box, phase, patch_verdict, gripper_box, ...).
+- UnifiedDefenseInterface: one-step interface (known vs auto mode).
 
 Design goals:
-- Backward compatible: existing scripts that assume known patch location still work.
-- No new dependencies: connected components are implemented via pure NumPy.
-- Practical control: supports continuous masking with verifier-triggered reacquire.
+- Backward compatible: known-mode and auto without gripper prior still work.
+- Minimal deps: NumPy; optional GripperPrior/PatchSelector for multimodal path.
 """
 
 from __future__ import annotations
@@ -32,7 +41,9 @@ from .temporal import (
     GateDecision,
     grid_iou,
 )
-from .verifier import VerifierProtocol, roi_mass as heatmap_roi_mass
+from .verifier import VerifierProtocol, roi_mass as heatmap_roi_mass, refine_mask_with_constraints
+from .gripper_prior import GripperPrior
+from .patch_selector import PatchSelector
 
 # PRAC checker (optional import to avoid circular dependency)
 try:
@@ -271,6 +282,10 @@ class DefenseDecision:
     prac_odr: Optional[float] = None  # Outlier Dependency Ratio
     prac_mer: Optional[float] = None  # Mainland Erosion Risk
     prac_stats: Optional[dict] = None  # Full PRAC statistics
+    
+    # New geometric prior fields
+    gripper_box: Optional[PatchBox] = None
+    patch_verdict: Optional[str] = None  # "NO_PATCH" | "PATCH_FOUND" | "NEAR_TASK_PATCH"
 
 
 class OnlinePatchDefenseController:
@@ -309,6 +324,12 @@ class OnlinePatchDefenseController:
         # PRAC checker (optional, plugin)
         prac_checker: Optional[Any] = None,  # PRACChecker
         prac_enabled: bool = True,  # Enable PRAC if prac_checker is provided
+        
+        # Multimodal prior and selector
+        gripper_prior: Optional[GripperPrior] = None,
+        patch_selector: Optional[PatchSelector] = None,
+        tau_protect: float = 0.1,  # Maximum allowed overlap ratio with G_px
+        tau_cover: float = 0.5,    # Minimum required coverage ratio of original ROI
     ) -> None:
         self.hook = hook
         self.localizer = localizer
@@ -336,6 +357,12 @@ class OnlinePatchDefenseController:
         # PRAC checker
         self.prac_checker = prac_checker
         self.prac_enabled = bool(prac_enabled) and (prac_checker is not None)
+
+        # Multimodal prior
+        self.gripper_prior = gripper_prior
+        self.patch_selector = patch_selector
+        self.tau_protect = float(tau_protect)
+        self.tau_cover = float(tau_cover)
 
         # --- Simplified controller state (ACQUIRE/TRACK) ---
         self._tracking: bool = False
@@ -392,11 +419,13 @@ class OnlinePatchDefenseController:
         forward_fn: Optional[Callable[[np.ndarray], Any]] = None,
         heatmap_fn: Optional[Callable[[], np.ndarray]] = None,
         hm_current: Optional[np.ndarray] = None,
+        eef_pos: Optional[np.ndarray] = None,
     ) -> DefenseDecision:
         """
         Args:
             grid: saliency grid (e.g., 16x16), requires the hook cache already populated.
             image/purify_fn/forward_fn/heatmap_fn: only needed if you enable counterfactual verification.
+            eef_pos: End-effector pose array for multimodal geometric prior.
         """
         self._t += 1
         if grid.ndim != 2:
@@ -411,16 +440,41 @@ class OnlinePatchDefenseController:
         st = self._stats.update(grid)
         stable_grid = st.stable  # long-term high + low variance
 
+        # --- Multimodal Geometric Prior (Step 0) ---
+        G_px = None
+        G_grid = None
+        gripper_box = None
+        img_shape = (256, 256)
+        if image is not None:
+            img_shape = image.shape[:2]
+        elif hm_current is not None:
+            img_shape = hm_current.shape[:2]
+        
+        if self.gripper_prior is not None and eef_pos is not None:
+            g_px_tuple, G_grid = self.gripper_prior.compute(eef_pos, img_shape, grid.shape)
+            G_px = PatchBox(x0=g_px_tuple[0], y0=g_px_tuple[1], x1=g_px_tuple[2], y1=g_px_tuple[3])
+            gripper_box = G_px
+
         # ---------------------------------------------------------------------
-        # PRAC LOCKED MODE (user requested):
-        # - First step: localize + PRAC over Top-K candidates, pick the best patch ROI, lock it.
-        # - Subsequent steps: always purify the locked ROI (no localize / no PRAC / no gate / no verifier).
+        # LOCKED MODE (Multimodal or PRAC):
+        # - First step: localize + select best patch ROI, lock it.
+        # - Subsequent steps: purify the locked ROI (with mask refinement if applicable).
         # ---------------------------------------------------------------------
         if bool(self._locked) and (self._locked_outlier_grid is not None):
             roi_grid_locked = self._locked_outlier_grid
             main_grid_locked = self._locked_main_grid
             x0, y0, x1, y1 = roi_grid_locked.gx0, roi_grid_locked.gy0, roi_grid_locked.gx1, roi_grid_locked.gy1
             roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+
+            # --- Mask verification/refinement (Step 4) ---
+            if G_px is not None:
+                rx0, ry0, rx1, ry1 = refine_mask_with_constraints(
+                    initial_roi_px=roi_box, 
+                    G_px=G_px, 
+                    tau_protect=self.tau_protect, 
+                    tau_cover=self.tau_cover
+                )
+                roi_box = PatchBox(x0=rx0, y0=ry0, x1=rx1, y1=ry1)
 
             # Best-effort heatmap mass (for logging only; does not affect decision).
             mass_heatmap = None
@@ -461,10 +515,12 @@ class OnlinePatchDefenseController:
                 prac_odr=None,
                 prac_mer=None,
                 prac_stats=None,
+                gripper_box=gripper_box,
+                patch_verdict=getattr(self, "_locked_patch_verdict", "PATCH_FOUND"),
             )
 
         if not bool(self._locked):
-            # One-time ACQUIRE + PRAC lock.
+            # One-time ACQUIRE + Lock.
             tlr = self.localizer.localize(stable_grid)
             top_k_candidates = getattr(tlr, "top_k_candidates", [])
             if (not top_k_candidates) and (tlr.outlier_roi is not None):
@@ -472,115 +528,85 @@ class OnlinePatchDefenseController:
 
             best_roi: Optional[GridBox] = None
             best_reason: str = "lock_no_candidate"
-            prac_performed: bool = False
-            prac_verdict: Optional[str] = None
-            prac_odr: Optional[float] = None
-            prac_mer: Optional[float] = None
-            prac_stats_dict: Optional[dict] = None
+            patch_verdict_str = "NO_PATCH"
 
-            # If PRAC inputs are available, score each candidate by ROI-masked global shift.
-            if (
-                bool(self.prac_enabled)
-                and (self.prac_checker is not None)
-                and isinstance(top_k_candidates, list)
-                and top_k_candidates
-                and (image is not None)
-                and (forward_fn is not None)
-            ):
-                # Log PRAC execution start
-                print(f"[PRAC_ACQUIRE] Starting PRAC evaluation: top_k_candidates={len(top_k_candidates)}, prac_enabled={self.prac_enabled}, prac_checker={self.prac_checker is not None}")
-                
-                def forward_ctx(img: np.ndarray) -> None:
-                    """Forward context: clear hook and run forward (action discarded)."""
-                    if hasattr(self.hook, "clear"):
-                        self.hook.clear()
-                    forward_fn(img)
+            # Step 2: PatchSelector
+            if self.patch_selector is not None and G_grid is not None:
+                ps_res = self.patch_selector.select(top_k_candidates, G_grid)
+                patch_verdict_str = ps_res.verdict
+                best_roi = ps_res.roi
+                best_reason = ps_res.reason
 
-                def grid_readout() -> np.ndarray:
-                    """Read attention grid after forward."""
-                    return self.hook.get_saliency_grid()
-
-                scored = []
-                for idx, (candidate_roi, candidate_score) in enumerate(top_k_candidates):
-                    if candidate_roi is None:
-                        continue
-                    # Map candidate ROI to pixel box for ROI-restricted perturbations.
-                    bx0, by0, bx1, by1 = candidate_roi.gx0, candidate_roi.gy0, candidate_roi.gx1, candidate_roi.gy1
-                    pb = self.hook.grid_bbox_to_patch_box(int(bx0), int(by0), int(bx1), int(by1))
-                    roi_box_xyxy = (int(pb.x0), int(pb.y0), int(pb.x1), int(pb.y1))
-
-                    try:
-                        score_obj = self.prac_checker.score_candidate_with_roi_mask(
-                            image=image,
-                            base_grid=grid,
-                            outlier_roi=candidate_roi,
-                            main_roi=tlr.main_roi,
-                            roi_box_xyxy=roi_box_xyxy,
-                            forward_ctx=forward_ctx,
-                            grid_readout=grid_readout,
-                        )
-                        # Log each candidate's PRAC score
-                        print(f"[PRAC_CANDIDATE] candidate_idx={idx}, roi=({candidate_roi.gx0},{candidate_roi.gy0},{candidate_roi.gx1},{candidate_roi.gy1}), "
-                              f"score={score_obj.score:.4f}, drop_rate={score_obj.drop_rate:.4f}, "
-                              f"l1_shift={score_obj.l1_shift:.4f}, base_outlier_mass={score_obj.base_outlier_mass:.4f}")
-                    except Exception as e:
-                        print(f"[PRAC_CANDIDATE] candidate_idx={idx} scoring failed: {e}")
-                        continue
-                    scored.append((score_obj, candidate_roi, float(candidate_score)))
-
-                if scored:
-                    scored.sort(key=lambda t: float(t[0].score), reverse=True)
-                    best_score_obj, best_roi, _ = scored[0]
-                    prac_performed = True
-                    prac_verdict = "LOCK_MAX_DROP"
-                    # Reuse legacy fields for logging without changing the logging schema.
-                    prac_odr = float(best_score_obj.drop_rate)   # logged as "ODR"
-                    prac_mer = float(best_score_obj.l1_shift)    # logged as "MER"
-                    prac_stats_dict = dict(best_score_obj.debug)
-                    best_reason = f"locked_by_prac_drop={best_score_obj.drop_rate:.3f}_l1={best_score_obj.l1_shift:.3f}"
-                    # Log PRAC lock success
-                    print(f"[PRAC_LOCK] prac_performed={prac_performed}, prac_verdict={prac_verdict}, "
-                          f"best_reason={best_reason}, prac_odr={prac_odr:.4f}, prac_mer={prac_mer:.4f}, "
-                          f"selected_roi=({best_roi.gx0},{best_roi.gy0},{best_roi.gx1},{best_roi.gy1}), "
-                          f"scored_candidates={len(scored)}")
-                else:
-                    # PRAC enabled but failed to score; fallback to top-1 candidate.
-                    if top_k_candidates:
-                        best_roi, _ = top_k_candidates[0]
-                        best_reason = "lock_fallback_top1_prac_failed"
-                        print(f"[PRAC_FALLBACK] reason={best_reason}, top_k_count={len(top_k_candidates)}, "
-                              f"scored_count=0 (all candidates failed PRAC scoring)")
+                if patch_verdict_str == "NO_PATCH":
+                    # Step 3: NO_PATCH -> return without purifying
+                    return DefenseDecision(
+                        should_purify=False,
+                        roi_box=None,
+                        grid_box=None,
+                        main_grid_box=tlr.main_roi,
+                        outlier_score=0.0,
+                        mass_ema=0.0,
+                        raw_mass=0.0,
+                        state="NO_PATCH",
+                        reason=best_reason,
+                        strength=None,
+                        verified=None,
+                        verify_stats=None,
+                        mass_heatmap=None,
+                        quality_ok=None,
+                        quality_reason="no_patch_candidate",
+                        gate_checked=False,
+                        verdict_code="NA",
+                        phase="ACQUIRE",
+                        reacquire_needed=True,
+                        verify_performed=False,
+                        prac_performed=False,
+                        prac_verdict=None,
+                        prac_odr=None,
+                        prac_mer=None,
+                        prac_stats=None,
+                        gripper_box=gripper_box,
+                        patch_verdict=patch_verdict_str,
+                    )
             else:
-                # PRAC disabled or missing inputs; lock top-1 candidate.
+                # Fallback: Top-1
                 if isinstance(top_k_candidates, list) and top_k_candidates:
                     best_roi, _ = top_k_candidates[0]
-                    best_reason = "lock_fallback_top1_prac_disabled"
-                    print(f"[PRAC_FALLBACK] reason={best_reason}, prac_enabled={self.prac_enabled}, "
-                          f"prac_checker={self.prac_checker is not None}, top_k_count={len(top_k_candidates)}, "
-                          f"image={image is not None}, forward_fn={forward_fn is not None}")
+                    best_reason = "lock_fallback_top1"
+                    patch_verdict_str = "PATCH_FOUND"
 
             if best_roi is not None:
                 # Lock ROI for the rest of the episode.
                 self._locked = True
                 self._locked_outlier_grid = best_roi
                 self._locked_main_grid = tlr.main_roi
-                self._lock_prac_debug = prac_stats_dict
+                self._locked_patch_verdict = patch_verdict_str
 
-                # Return the forced purify decision immediately (this step included).
+                # Return the forced purify decision immediately.
                 x0, y0, x1, y1 = best_roi.gx0, best_roi.gy0, best_roi.gx1, best_roi.gy1
                 roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+
+                # Step 4: Mask Verification/Refinement
+                if G_px is not None:
+                    rx0, ry0, rx1, ry1 = refine_mask_with_constraints(
+                        initial_roi_px=roi_box, 
+                        G_px=G_px, 
+                        tau_protect=self.tau_protect, 
+                        tau_cover=self.tau_cover
+                    )
+                    roi_box = PatchBox(x0=rx0, y0=ry0, x1=rx1, y1=ry1)
 
                 mass_heatmap = None
                 if hm_current is not None:
                     try:
                         mass_heatmap = float(heatmap_roi_mass(hm_current, roi_box))
                     except Exception:
-                        mass_heatmap = None
+                        pass
                 elif heatmap_fn is not None:
                     try:
                         mass_heatmap = float(heatmap_roi_mass(heatmap_fn(), roi_box))
                     except Exception:
-                        mass_heatmap = None
+                        pass
 
                 return DefenseDecision(
                     should_purify=True,
@@ -603,14 +629,16 @@ class OnlinePatchDefenseController:
                     phase="LOCKED",
                     reacquire_needed=False,
                     verify_performed=False,
-                    prac_performed=prac_performed,
-                    prac_verdict=prac_verdict,
-                    prac_odr=prac_odr,
-                    prac_mer=prac_mer,
-                    prac_stats=prac_stats_dict,
+                    prac_performed=False,
+                    prac_verdict=None,
+                    prac_odr=None,
+                    prac_mer=None,
+                    prac_stats=None,
+                    gripper_box=gripper_box,
+                    patch_verdict=patch_verdict_str,
                 )
 
-        # --- (B) ACQUIRE/TRACK controller ---
+        # --- (B) ACQUIRE/TRACK controller (Legacy continuous tracking) ---
         # ACQUIRE: run localizer only when needed; TRACK: keep using the last ROI.
         main_grid: Optional[GridBox] = self._current_main_grid
         roi_grid: Optional[GridBox] = self._current_outlier_grid
@@ -909,6 +937,8 @@ class OnlinePatchDefenseController:
                 prac_odr=prac_odr,
                 prac_mer=prac_mer,
                 prac_stats=prac_stats_dict,
+                gripper_box=gripper_box,
+                patch_verdict=None,
             )
             # Enter TRACK
             self._tracking = True
@@ -1005,6 +1035,8 @@ class OnlinePatchDefenseController:
             prac_odr=prac_odr,
             prac_mer=prac_mer,
             prac_stats=prac_stats_dict,
+            gripper_box=gripper_box,
+            patch_verdict=None,
         )
 
 
@@ -1041,6 +1073,10 @@ class UnifiedDefenseResult:
 
     # Optional visualization (both modes; only populated when enabled).
     heatmap: Optional[np.ndarray] = None
+
+    # New geometric prior fields
+    gripper_box: Optional[PatchBox] = None
+    patch_verdict: Optional[str] = None
 
 
 class UnifiedDefenseInterface:
@@ -1105,6 +1141,7 @@ class UnifiedDefenseInterface:
         forward_fn: Optional[Callable[[np.ndarray], Any]] = None,
         heatmap_fn: Optional[Callable[[], np.ndarray]] = None,
         hm_current: Optional[np.ndarray] = None,
+        eef_pos: Optional[np.ndarray] = None,
     ) -> UnifiedDefenseResult:
         """
         Args:
@@ -1138,6 +1175,8 @@ class UnifiedDefenseInterface:
                 verify_stats=None,
                 verdict_code="NA",
                 heatmap=heatmap,
+                gripper_box=None,
+                patch_verdict=None,
             )
 
         # auto mode
@@ -1154,6 +1193,7 @@ class UnifiedDefenseInterface:
             forward_fn=forward_fn,
             heatmap_fn=heatmap_fn,
             hm_current=hm_current,
+            eef_pos=eef_pos,
         )
         heatmap = self.hook.get_heatmap() if self.use_heatmap_for_viz else None
 
@@ -1174,4 +1214,6 @@ class UnifiedDefenseInterface:
             verify_performed=getattr(dd, "verify_performed", None),
             verdict_code=str(dd.verdict_code),
             heatmap=heatmap,
+            gripper_box=getattr(dd, "gripper_box", None),
+            patch_verdict=getattr(dd, "patch_verdict", None),
         )

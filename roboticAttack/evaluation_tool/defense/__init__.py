@@ -1,4 +1,4 @@
-"""Online defense utilities (attention-based detection + localization + purification)."""
+"""Online defense: attention-based detection, multimodal prior (GripperPrior, PatchSelector), localization, and purification."""
 
 from .online_defense import OnlineAttentionHook
 
@@ -30,6 +30,9 @@ from .verifier import (
 
 from .logging_utils import defense_result_to_log_dict, format_defense_log_line
 
+from .gripper_prior import GripperPrior, GripperPriorConfig
+from .patch_selector import PatchSelector, PatchSelectorConfig, PatchSelectResult
+
 __all__ = [
     # Sensor
     "OnlineAttentionHook",
@@ -59,4 +62,10 @@ __all__ = [
     # Logging helpers
     "defense_result_to_log_dict",
     "format_defense_log_line",
+    # Multimodal geometry prior components
+    "GripperPrior",
+    "GripperPriorConfig",
+    "PatchSelector",
+    "PatchSelectorConfig",
+    "PatchSelectResult",
 ]

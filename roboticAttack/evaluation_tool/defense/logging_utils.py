@@ -1,9 +1,9 @@
 """Structured logging helpers for the defense pipeline.
 
-Design goals:
-- Keep the main evaluation script clean (no ad-hoc string parsing).
-- Provide consistent fields across modes (KNOWN / ACQUIRE / TRACK).
-- Avoid logging legacy metrics (e.g., patch_mass/entropy) unless the caller explicitly adds them.
+Converts DefenseDecision/UnifiedDefenseResult to a JSON-serializable dict and a
+one-line log string. Supports phase, should_purify, roi_box, patch_verdict,
+gripper_box, and legacy PRAC/verifier fields. Keeps the main evaluation script
+free of ad-hoc parsing; consistent across KNOWN / ACQUIRE / TRACK / LOCKED.
 """
 
 from __future__ import annotations
@@ -58,6 +58,9 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
         "prac_odr",
         "prac_mer",
         "prac_stats",
+        # New geometric fields
+        "patch_verdict",
+        "gripper_box",
     ]:
         base.setdefault(k, None)
 
@@ -88,6 +91,9 @@ def format_defense_log_line(step: int, result: Any) -> str:
         f"verdict={d.get('verdict_code')}",
         f"verified={d.get('verified')}",
     ]
+    
+    if d.get("patch_verdict"):
+        parts.append(f"patch={d.get('patch_verdict')}")
     
     # Add PRAC fields if available
     if d.get("prac_performed"):
