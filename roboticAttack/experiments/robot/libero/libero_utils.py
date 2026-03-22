@@ -8,6 +8,11 @@ import numpy as np
 import tensorflow as tf
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from evaluation_tool.defense.geometry_alignment import (
+    DEFAULT_POLICY_IMAGE_ROTATE_180,
+    apply_policy_image_alignment,
+    normalize_resize_size,
+)
 
 from experiments.robot.robot_utils import (
     DATE,
@@ -47,13 +52,10 @@ def resize_image(img, resize_size):
     return img
 
 
-def get_libero_image(obs, resize_size):
+def get_libero_image(obs, resize_size, rotate_180: bool = DEFAULT_POLICY_IMAGE_ROTATE_180):
     """Extracts image from observations and preprocesses it."""
-    assert isinstance(resize_size, int) or isinstance(resize_size, tuple)
-    if isinstance(resize_size, int):
-        resize_size = (resize_size, resize_size)
-    img = obs["agentview_image"]
-    img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
+    resize_size = normalize_resize_size(resize_size)
+    img = apply_policy_image_alignment(obs["agentview_image"], rotate_180=bool(rotate_180))
     img = resize_image(img, resize_size)
     return img
 

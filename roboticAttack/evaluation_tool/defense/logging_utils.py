@@ -9,7 +9,9 @@ free of ad-hoc parsing; consistent across KNOWN / ACQUIRE / TRACK / LOCKED.
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+from .geometry_alignment import points_rc_to_xyxy_box
 
 
 def _box_to_dict(box: Any) -> Optional[Dict[str, int]]:
@@ -36,6 +38,10 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
 
     # Normalize ROI box.
     base["roi_box"] = _box_to_dict(getattr(result, "roi_box", None))
+    base["gripper_box"] = _box_to_dict(getattr(result, "gripper_box", None))
+    base["arm_region_box"] = _box_to_dict(getattr(result, "arm_region_box", None))
+    base["arm_core_box"] = _box_to_dict(getattr(result, "arm_core_box", None))
+    base["arm_guard_box"] = _box_to_dict(getattr(result, "arm_guard_box", None))
 
     # Ensure commonly used keys exist (avoid KeyError in scripts).
     for k in [
@@ -61,6 +67,21 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
         # New geometric fields
         "patch_verdict",
         "gripper_box",
+        "arm_region_box",
+        "arm_core_box",
+        "arm_guard_box",
+        "joint_points_2d",
+        "gripper_points_2d",
+        "gripper_points_render_2d",
+        "gripper_point_keys_used",
+        "gripper_link_name_pairs",
+        "gripper_link_segments_2d",
+        "gripper_link_quads_2d",
+        "joint_names_used",
+        "joint_points_render_2d",
+        "arm_link_name_pairs",
+        "arm_link_segments_2d",
+        "arm_link_quads_2d",
     ]:
         base.setdefault(k, None)
 
@@ -94,6 +115,18 @@ def format_defense_log_line(step: int, result: Any) -> str:
     
     if d.get("patch_verdict"):
         parts.append(f"patch={d.get('patch_verdict')}")
+    if d.get("arm_core_box") is not None:
+        parts.append(f"arm_core={d.get('arm_core_box')}")
+    if d.get("arm_guard_box") is not None:
+        parts.append(f"arm_guard={d.get('arm_guard_box')}")
+    if d.get("gripper_points_2d") is not None:
+        parts.append(f"gripper_pts={len(d.get('gripper_points_2d') or [])}")
+    if d.get("gripper_link_segments_2d") is not None:
+        parts.append(f"gripper_links={len(d.get('gripper_link_segments_2d') or [])}")
+    if d.get("joint_points_2d") is not None:
+        parts.append(f"joints={len(d.get('joint_points_2d') or [])}")
+    if d.get("arm_link_segments_2d") is not None:
+        parts.append(f"links={len(d.get('arm_link_segments_2d') or [])}")
     
     # Add PRAC fields if available
     if d.get("prac_performed"):
@@ -111,5 +144,87 @@ def format_defense_log_line(step: int, result: Any) -> str:
     if isinstance(reason, str) and reason:
         parts.append(f"reason={reason}")
     return " | ".join(parts)
+
+
+def _rc_range(points: Any) -> Optional[str]:
+    """Summarize a list of (row, col) points with explicit axis names."""
+    if not isinstance(points, list) or not points:
+        return None
+    try:
+        rows = [int(p[0]) for p in points]
+        cols = [int(p[1]) for p in points]
+    except Exception:
+        return None
+    return f"col=[{min(cols)},{max(cols)}] row=[{min(rows)},{max(rows)}]"
+
+
+def _rc_box(points: Any) -> Optional[str]:
+    """Summarize a list of (row, col) points as an xyxy box."""
+    if not isinstance(points, list) or not points:
+        return None
+    try:
+        max_row = max(int(p[0]) for p in points) + 1
+        max_col = max(int(p[1]) for p in points) + 1
+        box = points_rc_to_xyxy_box(points, hw=(max_row, max_col))
+    except Exception:
+        return None
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    return f"xyxy=({x0},{y0},{x1},{y1})"
+
+
+def format_defense_geometry_lines(step: int, result: Any) -> List[str]:
+    """Format verbose geometry debug lines for terminal output."""
+    d = defense_result_to_log_dict(result)
+    lines: List[str] = []
+
+    gripper_policy = d.get("gripper_points_2d")
+    gripper_render = d.get("gripper_points_render_2d")
+    gripper_names = d.get("gripper_point_keys_used")
+    gripper_links = d.get("gripper_link_name_pairs")
+    gripper_segments = d.get("gripper_link_segments_2d")
+    if gripper_policy:
+        summary = _rc_range(gripper_policy)
+        box_summary = _rc_box(gripper_policy)
+        lines.append(
+            f"[DEFENSE][GEOM][GRIPPER] step={int(step)} names={gripper_names} "
+            f"render_rc={gripper_render} policy_rc={gripper_policy}"
+            + (f" | {summary}" if summary else "")
+            + (f" | {box_summary}" if box_summary else "")
+        )
+    if gripper_links and gripper_segments and len(gripper_links) == len(gripper_segments):
+        link_entries = [
+            (gripper_links[i][0], gripper_links[i][1], gripper_segments[i][0], gripper_segments[i][1])
+            for i in range(len(gripper_links))
+        ]
+        lines.append(f"[DEFENSE][GEOM][GRIPPER_LINKS] step={int(step)} segments={link_entries}")
+    elif gripper_links:
+        lines.append(f"[DEFENSE][GEOM][GRIPPER_LINKS] step={int(step)} links={gripper_links}")
+
+    joint_policy = d.get("joint_points_2d")
+    joint_render = d.get("joint_points_render_2d")
+    joint_names = d.get("joint_names_used")
+    arm_links = d.get("arm_link_name_pairs")
+    arm_segments = d.get("arm_link_segments_2d")
+    if joint_policy:
+        summary = _rc_range(joint_policy)
+        box_summary = _rc_box(joint_policy)
+        lines.append(
+            f"[DEFENSE][GEOM][ARM] step={int(step)} joints={joint_names} "
+            f"render_rc={joint_render} policy_rc={joint_policy}"
+            + (f" | {summary}" if summary else "")
+            + (f" | {box_summary}" if box_summary else "")
+        )
+    if arm_links and arm_segments and len(arm_links) == len(arm_segments):
+        link_entries = [
+            (arm_links[i][0], arm_links[i][1], arm_segments[i][0], arm_segments[i][1])
+            for i in range(len(arm_links))
+        ]
+        lines.append(f"[DEFENSE][GEOM][ARM_LINKS] step={int(step)} segments={link_entries}")
+    elif arm_links:
+        lines.append(f"[DEFENSE][GEOM][ARM_LINKS] step={int(step)} links={arm_links}")
+
+    return lines
 
 

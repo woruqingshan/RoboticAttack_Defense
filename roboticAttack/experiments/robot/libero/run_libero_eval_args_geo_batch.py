@@ -105,10 +105,14 @@ from evaluation_tool.defense import (
     CounterfactualVerifier,
     NoOpVerifier,
     format_defense_log_line,
+    format_defense_geometry_lines,
     defense_result_to_log_dict,
     # Multimodal geometry prior components
     GripperPrior,
     GripperPriorConfig,
+    ArmSkeletonPrior,
+    ArmSkeletonPriorConfig,
+    GeometryRuntimeContext,
     PatchSelector,
     PatchSelectorConfig,
 )
@@ -133,6 +137,11 @@ def _defense_debug_print(cfg, msg: str, log_file=None) -> None:
 def _defense_debug_every_step(cfg) -> bool:
     """Return True when step-level defense debug logs are enabled."""
     return bool(getattr(cfg, "defense_debug", False) and getattr(cfg, "defense_debug_every_step", False))
+
+
+def _defense_debug_geometry(cfg) -> bool:
+    """Return True when verbose geometry debug logs are enabled."""
+    return bool(getattr(cfg, "defense_debug", False) and getattr(cfg, "defense_debug_geometry", False))
 
 def _normalize_heatmap_uint8(heatmap) -> "np.ndarray":
     """Normalize a float heatmap into uint8 [0,255] for visualization."""
@@ -164,12 +173,28 @@ def _make_overlay_rgb(image_rgb, heatmap, alpha: float):
         hm_u8 = _normalize_heatmap_uint8(heatmap)
         return np.stack([hm_u8, hm_u8, hm_u8], axis=-1)
 
-def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"], gripper_box=None, arm_region_box=None):
+def _maybe_pack_replay_frame(
+    cfg,
+    image_rgb,
+    heatmap: Optional["np.ndarray"],
+    gripper_box=None,
+    arm_region_box=None,
+    gripper_points_2d=None,
+    gripper_link_segments_2d=None,
+    gripper_link_quads_2d=None,
+    joint_points_2d=None,
+    arm_link_segments_2d=None,
+    arm_link_quads_2d=None,
+):
     """Optionally concatenate the policy input and heatmap overlay side-by-side."""
     # If a gripper box is provided, draw it on the image_rgb (and overlay if created)
     img_to_pack = image_rgb.copy()
     try:
         import cv2
+        joint_radius = int(getattr(cfg, "defense_viz_joint_radius_px", 4))
+        line_thickness = int(getattr(cfg, "defense_viz_link_line_thickness", 2))
+        quad_thickness = int(getattr(cfg, "defense_viz_link_quad_thickness", 2))
+
         if gripper_box is not None:
             # Draw a green bounding box for the gripper prior
             cv2.rectangle(
@@ -178,7 +203,43 @@ def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"], gr
                 (int(gripper_box.x1), int(gripper_box.y1)),
                 (0, 255, 0), 2
             )
-        if arm_region_box is not None:
+        if gripper_points_2d is not None:
+            for row, col in gripper_points_2d:
+                cv2.circle(img_to_pack, (int(col), int(row)), joint_radius, (0, 255, 0), -1)
+        if gripper_link_quads_2d is not None:
+            for quad_xy in gripper_link_quads_2d:
+                if quad_xy is None or len(quad_xy) < 4:
+                    continue
+                quad_np = np.array([[int(x), int(y)] for x, y in quad_xy], dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(img_to_pack, [quad_np], isClosed=True, color=(0, 200, 0), thickness=quad_thickness)
+        if gripper_link_segments_2d is not None:
+            for p0_rc, p1_rc in gripper_link_segments_2d:
+                cv2.line(
+                    img_to_pack,
+                    (int(p0_rc[1]), int(p0_rc[0])),
+                    (int(p1_rc[1]), int(p1_rc[0])),
+                    (0, 180, 0),
+                    line_thickness,
+                )
+        if arm_link_quads_2d is not None:
+            for quad_xy in arm_link_quads_2d:
+                if quad_xy is None or len(quad_xy) < 4:
+                    continue
+                quad_np = np.array([[int(x), int(y)] for x, y in quad_xy], dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(img_to_pack, [quad_np], isClosed=True, color=(255, 0, 0), thickness=quad_thickness)
+        if arm_link_segments_2d is not None:
+            for p0_rc, p1_rc in arm_link_segments_2d:
+                cv2.line(
+                    img_to_pack,
+                    (int(p0_rc[1]), int(p0_rc[0])),
+                    (int(p1_rc[1]), int(p1_rc[0])),
+                    (255, 255, 0),
+                    line_thickness,
+                )
+        if joint_points_2d is not None:
+            for row, col in joint_points_2d:
+                cv2.circle(img_to_pack, (int(col), int(row)), joint_radius, (255, 255, 0), -1)
+        if arm_region_box is not None and not arm_link_quads_2d:
             # Draw a blue bounding box for the arm region (for verification)
             x0, y0, x1, y1 = arm_region_box
             cv2.rectangle(img_to_pack, (int(x0), int(y0)), (int(x1), int(y1)), (255, 0, 0), 2)
@@ -367,25 +428,55 @@ def eval_libero(cfg) -> None:
             
             # Create Multimodal prior components if enabled
             gripper_prior = None
+            arm_skeleton_prior = None
             patch_selector = None
             if getattr(cfg, "defense_gripper_prior_enabled", True):
                 gp_cfg = GripperPriorConfig(
-                    radius_px=getattr(cfg, "defense_gripper_radius_px", 40),
-                    cam_fx=getattr(cfg, "defense_gripper_cam_fx", 100.0),
-                    cam_fy=getattr(cfg, "defense_gripper_cam_fy", 100.0),
-                    cam_cx=getattr(cfg, "defense_gripper_cam_cx", 128.0),
-                    cam_cy=getattr(cfg, "defense_gripper_cam_cy", 128.0),
-                    offset_x=getattr(cfg, "defense_gripper_offset_x", 0.0),
-                    offset_y=getattr(cfg, "defense_gripper_offset_y", 0.0),
-                    proj_u_axis=getattr(cfg, "defense_gripper_proj_u_axis", "y"),
-                    proj_v_axis=getattr(cfg, "defense_gripper_proj_v_axis", "z"),
-                    sign_u=int(getattr(cfg, "defense_gripper_sign_u", -1)),
-                    sign_v=int(getattr(cfg, "defense_gripper_sign_v", -1)),
-                    arm_orientation=getattr(cfg, "defense_arm_orientation", "vertical"),
-                    arm_extend_px=getattr(cfg, "defense_arm_extend_px", 0),
-                    arm_extend_ortho_px=getattr(cfg, "defense_arm_extend_ortho_px", 20),
+                    enabled=True,
+                    site_names=parse_csv_list(getattr(cfg, "defense_gripper_site_names", "grip_site,ft_frame")),
+                    body_names=parse_csv_list(
+                        getattr(
+                            cfg,
+                            "defense_gripper_body_names",
+                            "right_hand,right_gripper,eef,leftfinger,rightfinger,finger_joint1_tip,finger_joint2_tip",
+                        )
+                    ),
+                    segment_point_pairs=parse_csv_pairs(
+                        getattr(
+                            cfg,
+                            "defense_gripper_segment_pairs",
+                            "right_hand:ft_frame,ft_frame:grip_site,grip_site:finger_joint1_tip,grip_site:finger_joint2_tip",
+                        )
+                    ),
+                    name_prefixes=[""] + parse_csv_list(getattr(cfg, "defense_gripper_name_prefixes", "robot0_,Panda0_,Panda_")),
+                    camera_name=getattr(cfg, "defense_gripper_camera_name", "agentview"),
+                    point_radius_px=int(getattr(cfg, "defense_gripper_point_radius_px", 5)),
+                    core_thickness_px=int(getattr(cfg, "defense_gripper_core_thickness_px", 10)),
+                    guard_scale=float(getattr(cfg, "defense_gripper_guard_scale", 2.0)),
+                    segment_core_thicknesses=parse_csv_ints(getattr(cfg, "defense_gripper_segment_core_thicknesses", "")),
+                    segment_guard_scales=parse_csv_floats(getattr(cfg, "defense_gripper_segment_guard_scales", "")),
+                    min_valid_points=int(getattr(cfg, "defense_gripper_min_valid_points", 1)),
                 )
                 gripper_prior = GripperPrior(gp_cfg)
+
+                if getattr(cfg, "defense_arm_skeleton_enabled", False):
+                    arm_cfg = ArmSkeletonPriorConfig(
+                        enabled=True,
+                        geometry_source=getattr(cfg, "defense_arm_skeleton_source", "body"),
+                        body_names=parse_csv_list(
+                            getattr(cfg, "defense_arm_body_names", "base,link1,link2,link3,link4,link5,link6,link7,right_hand")
+                        ),
+                        site_names=parse_csv_list(getattr(cfg, "defense_arm_site_names", "")),
+                        name_prefixes=[""] + parse_csv_list(getattr(cfg, "defense_arm_name_prefixes", "robot0_,Panda0_,Panda_")),
+                        camera_name=getattr(cfg, "defense_arm_camera_name", "agentview"),
+                        joint_radius_px=int(getattr(cfg, "defense_arm_joint_radius_px", 4)),
+                        core_thickness_px=int(getattr(cfg, "defense_arm_core_thickness_px", 14)),
+                        guard_scale=float(getattr(cfg, "defense_arm_guard_scale", 1.8)),
+                        link_core_thicknesses=parse_csv_ints(getattr(cfg, "defense_arm_link_core_thicknesses", "")),
+                        link_guard_scales=parse_csv_floats(getattr(cfg, "defense_arm_link_guard_scales", "")),
+                        min_valid_points=int(getattr(cfg, "defense_arm_min_valid_points", 3)),
+                    )
+                    arm_skeleton_prior = ArmSkeletonPrior(arm_cfg)
                 
                 ps_cfg = PatchSelectorConfig(
                     tau_g=getattr(cfg, "defense_tau_g", 0.3),
@@ -408,6 +499,7 @@ def eval_libero(cfg) -> None:
                 prac_checker=prac_checker,
                 prac_enabled=getattr(cfg, "defense_prac_enabled", True),  # Default: enabled if prac_checker is provided
                 gripper_prior=gripper_prior,
+                arm_skeleton_prior=arm_skeleton_prior,
                 patch_selector=patch_selector,
                 tau_protect=getattr(cfg, "defense_tau_protect", 0.1),
                 tau_cover=getattr(cfg, "defense_tau_cover", 0.5),
@@ -531,7 +623,8 @@ def eval_libero(cfg) -> None:
                         continue
 
                     # Get preprocessed image
-                    img = get_libero_image(obs, resize_size) # Preprocess image for model
+                    policy_image_rotate_180 = bool(getattr(cfg, "defense_geometry_rotate_180", True))
+                    img = get_libero_image(obs, resize_size, rotate_180=policy_image_rotate_180) # Preprocess image for model
                     if cfg.use_patch:
                         img = randomPatchTransform.simulation_random_patch(
                             img, patch, geometry=True, colorjitter=False,
@@ -565,6 +658,12 @@ def eval_libero(cfg) -> None:
                     heatmap_for_viz = None
                     gripper_box_for_viz = None
                     arm_region_box_for_viz = None
+                    gripper_points_for_viz = None
+                    gripper_link_segments_for_viz = None
+                    gripper_link_quads_for_viz = None
+                    joint_points_for_viz = None
+                    arm_link_segments_for_viz = None
+                    arm_link_quads_for_viz = None
                     if defense_interface is not None:
                         try:
                             # Extract EEF pos for Multimodal Geometric Prior
@@ -572,6 +671,15 @@ def eval_libero(cfg) -> None:
                             eef_pos = np.concatenate(
                                 (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                             )
+                            geometry_ctx = None
+                            if "agentview_image" in obs:
+                                geometry_ctx = GeometryRuntimeContext(
+                                    sim=env.sim,
+                                    camera_name=getattr(cfg, "defense_arm_camera_name", "agentview"),
+                                    render_hw=tuple(obs["agentview_image"].shape[:2]),
+                                    policy_hw=tuple(img.shape[:2]),
+                                    policy_image_rotate_180=policy_image_rotate_180,
+                                )
 
                             # For auto mode, pass additional parameters
                             if defense_mode == "auto":
@@ -585,9 +693,10 @@ def eval_libero(cfg) -> None:
                                     heatmap_fn=lambda: defense_hook.get_heatmap(),
                                     hm_current=defense_hook.get_heatmap(),
                                     eef_pos=eef_pos,
+                                    geometry_ctx=geometry_ctx,
                                 )
                             else:
-                                defense_result = defense_interface.step(eef_pos=eef_pos)
+                                defense_result = defense_interface.step(eef_pos=eef_pos, geometry_ctx=geometry_ctx)
                         except Exception as defense_error:
                             # Exit immediately on defense errors to avoid empty episode analysis
                             error_msg = f"FATAL DEFENSE ERROR: {defense_error}"
@@ -601,6 +710,12 @@ def eval_libero(cfg) -> None:
                         if getattr(cfg, "defense_viz", False):
                             heatmap_for_viz = defense_result.heatmap
                             gripper_box_for_viz = getattr(defense_result, "gripper_box", None)
+                            gripper_points_for_viz = getattr(defense_result, "gripper_points_2d", None)
+                            gripper_link_segments_for_viz = getattr(defense_result, "gripper_link_segments_2d", None)
+                            gripper_link_quads_for_viz = getattr(defense_result, "gripper_link_quads_2d", None)
+                            joint_points_for_viz = getattr(defense_result, "joint_points_2d", None)
+                            arm_link_segments_for_viz = getattr(defense_result, "arm_link_segments_2d", None)
+                            arm_link_quads_for_viz = getattr(defense_result, "arm_link_quads_2d", None)
                         arm_region_box_for_viz = getattr(defense_result, "arm_region_box", None)
                         
                         # Statistics (new semantics)
@@ -625,6 +740,9 @@ def eval_libero(cfg) -> None:
                                 f"[DEFENSE] {format_defense_log_line(step=int(t), result=defense_result)}",
                                 log_file=log_file,
                             )
+                        if _defense_debug_geometry(cfg):
+                            for geom_line in format_defense_geometry_lines(step=int(t), result=defense_result):
+                                _defense_debug_print(cfg, geom_line, log_file=log_file)
                         
                         # Check if purification is needed (unified field)
                         if defense_result.should_purify and defense_result.roi_box is not None:
@@ -656,6 +774,12 @@ def eval_libero(cfg) -> None:
                         cfg, img_for_policy, heatmap_for_viz,
                         gripper_box=gripper_box_for_viz,
                         arm_region_box=arm_region_box_for_viz,
+                        gripper_points_2d=gripper_points_for_viz,
+                        gripper_link_segments_2d=gripper_link_segments_for_viz,
+                        gripper_link_quads_2d=gripper_link_quads_for_viz,
+                        joint_points_2d=joint_points_for_viz,
+                        arm_link_segments_2d=arm_link_segments_for_viz,
+                        arm_link_quads_2d=arm_link_quads_for_viz,
                     ))
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -768,6 +892,38 @@ def str2bool(value):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
+def parse_csv_list(value):
+    """Parse a comma-separated CLI string into a clean list."""
+    if value is None:
+        return []
+    parts = [item.strip() for item in str(value).split(",")]
+    return [item for item in parts if item]
+
+
+def parse_csv_ints(value):
+    """Parse a comma-separated CLI string into a list of ints."""
+    return [int(item) for item in parse_csv_list(value)]
+
+
+def parse_csv_floats(value):
+    """Parse a comma-separated CLI string into a list of floats."""
+    return [float(item) for item in parse_csv_list(value)]
+
+
+def parse_csv_pairs(value):
+    """Parse a comma-separated list like a:b,c:d into a list of string pairs."""
+    pairs = []
+    for item in parse_csv_list(value):
+        left, sep, right = item.partition(":")
+        if not sep:
+            continue
+        left = left.strip()
+        right = right.strip()
+        if left and right:
+            pairs.append((left, right))
+    return pairs
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate configuration for model training/evaluation")
     #################################################################################################################
@@ -844,8 +1000,13 @@ def parse_args():
     parser.add_argument("--defense_recompute_action", type=str2bool, default=True, help="Recompute action using purified image when defense triggers.")
     parser.add_argument("--defense_debug", type=str2bool, default=False, help="Print defense debug logs to terminal and log file.")
     parser.add_argument("--defense_debug_every_step", type=str2bool, default=False, help="When enabled, print defense scores for every step (debug only).")
+    parser.add_argument("--defense_debug_geometry", type=str2bool, default=False, help="When enabled, print projected gripper / arm geometry coordinates to the terminal (debug only).")
     parser.add_argument("--defense_viz", type=str2bool, default=False, help="If enabled, save side-by-side frames (policy input | heatmap overlay).")
     parser.add_argument("--defense_viz_alpha", type=float, default=0.45, help="Overlay alpha for heatmap visualization (0-1).")
+    parser.add_argument("--defense_geometry_rotate_180", type=str2bool, default=True, help="Whether the policy image applies a 180-degree rotation to the raw camera frame. Projected geometry derives its own row / col alignment from this setting.")
+    parser.add_argument("--defense_viz_joint_radius_px", type=int, default=4, help="Joint / gripper point radius in the defense visualization.")
+    parser.add_argument("--defense_viz_link_line_thickness", type=int, default=2, help="Center-line thickness for projected arm links in the defense visualization.")
+    parser.add_argument("--defense_viz_link_quad_thickness", type=int, default=2, help="Outline thickness for projected per-link quads in the defense visualization.")
     # Verifier parameters (counterfactual verification)
     parser.add_argument("--defense_verifier_enabled", type=str2bool, default=True, help="Enable counterfactual verifier (auto mode only).")
     parser.add_argument("--defense_verifier_min_mass_drop", type=float, default=0.15, help="Minimum relative ROI mass drop for verification (Tier 1).")
@@ -864,27 +1025,34 @@ def parse_args():
     
     # Multimodal Gripper Prior & Patch Selector parameters
     parser.add_argument("--defense_gripper_prior_enabled", type=str2bool, default=True, help="Enable multimodal geometric gripper prior.")
-    parser.add_argument("--defense_gripper_radius_px", type=int, default=40, help="Radius in pixels for the gripper protection zone (increase if green box too small).")
-    parser.add_argument("--defense_gripper_cam_fx", type=float, default=100.0, help="Gripper projection scale for horizontal (u).")
-    parser.add_argument("--defense_gripper_cam_fy", type=float, default=100.0, help="Gripper projection scale for vertical (v).")
-    parser.add_argument("--defense_gripper_cam_cx", type=float, default=128.0, help="Gripper projection center u (image center).")
-    parser.add_argument("--defense_gripper_cam_cy", type=float, default=128.0, help="Gripper projection center v (image center).")
-    parser.add_argument("--defense_gripper_offset_x", type=float, default=0.0, help="Gripper box horizontal offset in pixels (tune so green box centers on gripper).")
-    parser.add_argument("--defense_gripper_offset_y", type=float, default=0.0, help="Gripper box vertical offset in pixels.")
-    parser.add_argument("--defense_gripper_proj_u_axis", type=str, default="y", choices=["x", "y"], help="World axis for image u: x or y (try x if green box horizontally off).")
-    parser.add_argument("--defense_gripper_proj_v_axis", type=str, default="z", choices=["z", "y"], help="World axis for image v: z or y.")
-    parser.add_argument("--defense_gripper_sign_u", type=int, default=-1, choices=[-1, 1], help="Sign for u projection (-1 or 1).")
-    parser.add_argument("--defense_gripper_sign_v", type=int, default=-1, choices=[-1, 1], help="Sign for v projection (-1 or 1).")
+    parser.add_argument("--defense_gripper_site_names", type=str, default="grip_site,ft_frame", help="Comma-separated gripper site names used first for true camera projection.")
+    parser.add_argument("--defense_gripper_body_names", type=str, default="right_hand,right_gripper,eef,leftfinger,rightfinger,finger_joint1_tip,finger_joint2_tip", help="Comma-separated gripper body names used as fallback when sites are unavailable.")
+    parser.add_argument("--defense_gripper_segment_pairs", type=str, default="right_hand:ft_frame,ft_frame:grip_site,grip_site:finger_joint1_tip,grip_site:finger_joint2_tip", help="Comma-separated gripper segment pairs formatted as start:end.")
+    parser.add_argument("--defense_gripper_name_prefixes", type=str, default="robot0_,Panda0_,Panda_", help="Comma-separated name prefixes tried when resolving gripper sites / bodies.")
+    parser.add_argument("--defense_gripper_camera_name", type=str, default="agentview", help="Camera name used for true gripper projection.")
+    parser.add_argument("--defense_gripper_point_radius_px", type=int, default=5, help="Point radius in pixels around each projected gripper keypoint.")
+    parser.add_argument("--defense_gripper_core_thickness_px", type=int, default=10, help="Default thickness in pixels for projected gripper segments.")
+    parser.add_argument("--defense_gripper_guard_scale", type=float, default=2.0, help="Guard thickness scale relative to gripper core thickness.")
+    parser.add_argument("--defense_gripper_segment_core_thicknesses", type=str, default="", help="Optional comma-separated per-segment gripper core thickness overrides.")
+    parser.add_argument("--defense_gripper_segment_guard_scales", type=str, default="", help="Optional comma-separated per-segment gripper guard-scale overrides.")
+    parser.add_argument("--defense_gripper_min_valid_points", type=int, default=1, help="Minimum valid projected gripper points required to enable the per-frame gripper prior.")
     parser.add_argument("--defense_tau_g", type=float, default=0.3, help="Overlap threshold with GripperPrior for PatchSelector.")
-    parser.add_argument("--defense_tau_arm", type=float, default=0.3, help="Overlap threshold with arm region for PatchSelector (when arm_extend_px>0).")
+    parser.add_argument("--defense_tau_arm", type=float, default=0.3, help="Overlap threshold with projected arm masks for PatchSelector.")
     parser.add_argument("--defense_tau_patch_strength", type=float, default=0.05, help="Minimum anomaly mass for PatchSelector.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
-    # Arm region (extend G_px toward arm base for visualization and future PatchSelector use)
-    parser.add_argument("--defense_arm_orientation", type=str, default="vertical", choices=["vertical", "horizontal"],
-                        help="Arm mounting: vertical = arm above gripper (smaller y); horizontal = arm left/right.")
-    parser.add_argument("--defense_arm_extend_px", type=int, default=0, help="Pixels to extend G_px toward arm base; 0 = disabled.")
-    parser.add_argument("--defense_arm_extend_ortho_px", type=int, default=20, help="Perpendicular extension for arm band (pixels).")
+    parser.add_argument("--defense_arm_skeleton_enabled", type=str2bool, default=False, help="Enable arm skeleton prior built from simulator link poses.")
+    parser.add_argument("--defense_arm_skeleton_source", type=str, default="body", choices=["body", "site"], help="Use body or site poses as keypoints for arm skeleton construction.")
+    parser.add_argument("--defense_arm_body_names", type=str, default="base,link1,link2,link3,link4,link5,link6,link7,right_hand", help="Comma-separated body names for the arm skeleton keypoints.")
+    parser.add_argument("--defense_arm_site_names", type=str, default="", help="Comma-separated site names for the arm skeleton keypoints when source=site.")
+    parser.add_argument("--defense_arm_name_prefixes", type=str, default="robot0_,Panda0_,Panda_", help="Comma-separated name prefixes tried when resolving arm sites / bodies.")
+    parser.add_argument("--defense_arm_camera_name", type=str, default="agentview", help="Camera name used for true arm skeleton projection.")
+    parser.add_argument("--defense_arm_joint_radius_px", type=int, default=4, help="Joint marker radius in pixels added around every projected arm joint.")
+    parser.add_argument("--defense_arm_core_thickness_px", type=int, default=14, help="Pixel thickness of the hard ArmCore corridor.")
+    parser.add_argument("--defense_arm_guard_scale", type=float, default=1.8, help="Guard thickness scale relative to ArmCore.")
+    parser.add_argument("--defense_arm_link_core_thicknesses", type=str, default="", help="Optional comma-separated per-link ArmCore thickness overrides.")
+    parser.add_argument("--defense_arm_link_guard_scales", type=str, default="", help="Optional comma-separated per-link guard-scale overrides.")
+    parser.add_argument("--defense_arm_min_valid_points", type=int, default=3, help="Minimum valid projected keypoints required for the arm skeleton prior.")
 
     # PRAC checker parameters
     parser.add_argument("--defense_prac_enabled", type=str2bool, default=True, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")

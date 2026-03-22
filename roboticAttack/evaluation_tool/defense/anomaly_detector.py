@@ -43,6 +43,7 @@ from .temporal import (
 )
 from .verifier import VerifierProtocol, roi_mass as heatmap_roi_mass, refine_mask_with_constraints
 from .gripper_prior import GripperPrior
+from .arm_skeleton_prior import ArmSkeletonPrior, GeometryRuntimeContext
 from .patch_selector import PatchSelector
 
 # PRAC checker (optional import to avoid circular dependency)
@@ -288,6 +289,20 @@ class DefenseDecision:
     patch_verdict: Optional[str] = None  # "NO_PATCH" | "PATCH_FOUND" | "NEAR_TASK_PATCH"
     # Arm region (pixel box (x0,y0,x1,y1)) for visualization; from GripperPrior when arm_extend_px > 0
     arm_region_box: Optional[Tuple[int, int, int, int]] = None
+    arm_core_box: Optional[Tuple[int, int, int, int]] = None
+    arm_guard_box: Optional[Tuple[int, int, int, int]] = None
+    joint_points_2d: Optional[List[Tuple[int, int]]] = None
+    joint_names_used: Optional[List[str]] = None
+    joint_points_render_2d: Optional[List[Tuple[int, int]]] = None
+    gripper_points_2d: Optional[List[Tuple[int, int]]] = None
+    gripper_points_render_2d: Optional[List[Tuple[int, int]]] = None
+    gripper_point_keys_used: Optional[List[str]] = None
+    gripper_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+    gripper_link_name_pairs: Optional[List[Tuple[str, str]]] = None
+    gripper_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
+    arm_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+    arm_link_name_pairs: Optional[List[Tuple[str, str]]] = None
+    arm_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
 
 
 class OnlinePatchDefenseController:
@@ -329,6 +344,7 @@ class OnlinePatchDefenseController:
         
         # Multimodal prior and selector
         gripper_prior: Optional[GripperPrior] = None,
+        arm_skeleton_prior: Optional[ArmSkeletonPrior] = None,
         patch_selector: Optional[PatchSelector] = None,
         tau_protect: float = 0.1,  # Maximum allowed overlap ratio with G_px
         tau_cover: float = 0.5,    # Minimum required coverage ratio of original ROI
@@ -362,6 +378,7 @@ class OnlinePatchDefenseController:
 
         # Multimodal prior
         self.gripper_prior = gripper_prior
+        self.arm_skeleton_prior = arm_skeleton_prior
         self.patch_selector = patch_selector
         self.tau_protect = float(tau_protect)
         self.tau_cover = float(tau_cover)
@@ -422,12 +439,14 @@ class OnlinePatchDefenseController:
         heatmap_fn: Optional[Callable[[], np.ndarray]] = None,
         hm_current: Optional[np.ndarray] = None,
         eef_pos: Optional[np.ndarray] = None,
+        geometry_ctx: Optional[GeometryRuntimeContext] = None,
     ) -> DefenseDecision:
         """
         Args:
             grid: saliency grid (e.g., 16x16), requires the hook cache already populated.
             image/purify_fn/forward_fn/heatmap_fn: only needed if you enable counterfactual verification.
             eef_pos: End-effector pose array for multimodal geometric prior.
+            geometry_ctx: Simulator and camera context for the arm skeleton prior.
         """
         self._t += 1
         if grid.ndim != 2:
@@ -445,20 +464,81 @@ class OnlinePatchDefenseController:
         # --- Multimodal Geometric Prior (Step 0) ---
         G_px = None
         G_grid = None
+        gripper_core_grid_mask = None
+        gripper_guard_grid_mask = None
+        arm_core_mask_px = None
+        arm_guard_mask_px = None
+        arm_core_grid_mask = None
+        arm_guard_grid_mask = None
         arm_region_grid: Optional[GridBox] = None
         gripper_box = None
         arm_region_box: Optional[Tuple[int, int, int, int]] = None
+        arm_core_box: Optional[Tuple[int, int, int, int]] = None
+        arm_guard_box: Optional[Tuple[int, int, int, int]] = None
+        joint_points_2d: Optional[List[Tuple[int, int]]] = None
+        joint_names_used: Optional[List[str]] = None
+        joint_points_render_2d: Optional[List[Tuple[int, int]]] = None
+        gripper_points_2d: Optional[List[Tuple[int, int]]] = None
+        gripper_points_render_2d: Optional[List[Tuple[int, int]]] = None
+        gripper_point_keys_used: Optional[List[str]] = None
+        gripper_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+        gripper_link_name_pairs: Optional[List[Tuple[str, str]]] = None
+        gripper_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
+        arm_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+        arm_link_name_pairs: Optional[List[Tuple[str, str]]] = None
+        arm_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
         img_shape = (256, 256)
         if image is not None:
             img_shape = image.shape[:2]
         elif hm_current is not None:
             img_shape = hm_current.shape[:2]
         
-        if self.gripper_prior is not None and eef_pos is not None:
-            g_px_tuple, G_grid, arm_region_px, arm_region_grid = self.gripper_prior.compute(eef_pos, img_shape, grid.shape)
-            G_px = PatchBox(x0=g_px_tuple[0], y0=g_px_tuple[1], x1=g_px_tuple[2], y1=g_px_tuple[3])
-            gripper_box = G_px
-            arm_region_box = arm_region_px  # (x0,y0,x1,y1) for visualization
+        if self.gripper_prior is not None and geometry_ctx is not None:
+            gripper_res = self.gripper_prior.compute(geometry_ctx, grid.shape)
+            if bool(gripper_res.valid) and gripper_res.gripper_guard_box_px is not None and gripper_res.gripper_guard_grid is not None:
+                g_px_tuple = gripper_res.gripper_guard_box_px
+                G_px = PatchBox(x0=g_px_tuple[0], y0=g_px_tuple[1], x1=g_px_tuple[2], y1=g_px_tuple[3])
+                G_grid = gripper_res.gripper_guard_grid
+                gripper_core_grid_mask = gripper_res.gripper_core_grid_mask
+                gripper_guard_grid_mask = gripper_res.gripper_guard_grid_mask
+                gripper_box = G_px
+                gripper_points_2d = list(gripper_res.gripper_points_policy_px)
+                gripper_points_render_2d = list(gripper_res.gripper_points_render_px)
+                gripper_point_keys_used = list(gripper_res.point_keys_used)
+                gripper_link_segments_2d = [
+                    (tuple(seg.start_point_policy_px), tuple(seg.end_point_policy_px))
+                    for seg in gripper_res.gripper_segments_2d
+                ]
+                gripper_link_name_pairs = [
+                    (str(seg.start_point_name), str(seg.end_point_name))
+                    for seg in gripper_res.gripper_segments_2d
+                ]
+                gripper_link_quads_2d = [list(seg.core_quad_xy) for seg in gripper_res.gripper_segments_2d]
+
+        if self.arm_skeleton_prior is not None and geometry_ctx is not None:
+            skeleton_res = self.arm_skeleton_prior.compute(geometry_ctx, grid.shape)
+            if bool(skeleton_res.valid):
+                arm_core_mask_px = skeleton_res.arm_core_mask_px
+                arm_guard_mask_px = skeleton_res.arm_guard_mask_px
+                arm_core_grid_mask = skeleton_res.arm_core_grid_mask
+                arm_guard_grid_mask = skeleton_res.arm_guard_grid_mask
+                arm_core_box = skeleton_res.arm_core_box_px
+                arm_guard_box = skeleton_res.arm_guard_box_px
+                joint_points_2d = list(skeleton_res.joint_points_policy_px)
+                joint_names_used = list(skeleton_res.joint_names_used)
+                joint_points_render_2d = list(skeleton_res.joint_points_render_px)
+                arm_link_segments_2d = [
+                    (tuple(seg.start_point_policy_px), tuple(seg.end_point_policy_px))
+                    for seg in skeleton_res.link_segments_2d
+                ]
+                arm_link_name_pairs = [
+                    (str(seg.start_joint_name), str(seg.end_joint_name))
+                    for seg in skeleton_res.link_segments_2d
+                ]
+                arm_link_quads_2d = [list(seg.core_quad_xy) for seg in skeleton_res.link_segments_2d]
+                # Keep the old arm_region_box field as a guard-region visualization fallback.
+                if arm_guard_box is not None:
+                    arm_region_box = arm_guard_box
 
         # ---------------------------------------------------------------------
         # LOCKED MODE (Multimodal or PRAC):
@@ -523,6 +603,20 @@ class OnlinePatchDefenseController:
                 gripper_box=gripper_box,
                 patch_verdict=getattr(self, "_locked_patch_verdict", "PATCH_FOUND"),
                 arm_region_box=arm_region_box,
+                arm_core_box=arm_core_box,
+                arm_guard_box=arm_guard_box,
+                joint_points_2d=joint_points_2d,
+                joint_names_used=joint_names_used,
+                joint_points_render_2d=joint_points_render_2d,
+                gripper_points_2d=gripper_points_2d,
+                gripper_points_render_2d=gripper_points_render_2d,
+                gripper_point_keys_used=gripper_point_keys_used,
+                gripper_link_segments_2d=gripper_link_segments_2d,
+                gripper_link_name_pairs=gripper_link_name_pairs,
+                gripper_link_quads_2d=gripper_link_quads_2d,
+                arm_link_segments_2d=arm_link_segments_2d,
+                arm_link_name_pairs=arm_link_name_pairs,
+                arm_link_quads_2d=arm_link_quads_2d,
             )
 
         if not bool(self._locked):
@@ -536,10 +630,20 @@ class OnlinePatchDefenseController:
             best_reason: str = "lock_no_candidate"
             patch_verdict_str = "NO_PATCH"
 
-            # Step 2: PatchSelector (filter by G_grid and optionally arm_region_grid)
-            if self.patch_selector is not None and G_grid is not None:
+            # Step 2: PatchSelector (filter by gripper / arm masks, with G_grid kept as fallback)
+            if self.patch_selector is not None and (
+                G_grid is not None
+                or gripper_core_grid_mask is not None
+                or gripper_guard_grid_mask is not None
+            ):
                 ps_res = self.patch_selector.select(
-                    top_k_candidates, G_grid, arm_region_grid=arm_region_grid
+                    top_k_candidates,
+                    G_grid=G_grid,
+                    gripper_core_grid_mask=gripper_core_grid_mask,
+                    gripper_guard_grid_mask=gripper_guard_grid_mask,
+                    arm_region_grid=arm_region_grid,
+                    arm_core_grid_mask=arm_core_grid_mask,
+                    arm_guard_grid_mask=arm_guard_grid_mask,
                 )
                 patch_verdict_str = ps_res.verdict
                 best_roi = ps_res.roi
@@ -576,6 +680,20 @@ class OnlinePatchDefenseController:
                         gripper_box=gripper_box,
                         patch_verdict=patch_verdict_str,
                         arm_region_box=arm_region_box,
+                        arm_core_box=arm_core_box,
+                        arm_guard_box=arm_guard_box,
+                        joint_points_2d=joint_points_2d,
+                        joint_names_used=joint_names_used,
+                        joint_points_render_2d=joint_points_render_2d,
+                        gripper_points_2d=gripper_points_2d,
+                        gripper_points_render_2d=gripper_points_render_2d,
+                        gripper_point_keys_used=gripper_point_keys_used,
+                        gripper_link_segments_2d=gripper_link_segments_2d,
+                        gripper_link_name_pairs=gripper_link_name_pairs,
+                        gripper_link_quads_2d=gripper_link_quads_2d,
+                        arm_link_segments_2d=arm_link_segments_2d,
+                        arm_link_name_pairs=arm_link_name_pairs,
+                        arm_link_quads_2d=arm_link_quads_2d,
                     )
             else:
                 # Fallback: Top-1
@@ -646,6 +764,20 @@ class OnlinePatchDefenseController:
                     gripper_box=gripper_box,
                     patch_verdict=patch_verdict_str,
                     arm_region_box=arm_region_box,
+                    arm_core_box=arm_core_box,
+                    arm_guard_box=arm_guard_box,
+                    joint_points_2d=joint_points_2d,
+                    joint_names_used=joint_names_used,
+                    joint_points_render_2d=joint_points_render_2d,
+                    gripper_points_2d=gripper_points_2d,
+                    gripper_points_render_2d=gripper_points_render_2d,
+                    gripper_point_keys_used=gripper_point_keys_used,
+                    gripper_link_segments_2d=gripper_link_segments_2d,
+                    gripper_link_name_pairs=gripper_link_name_pairs,
+                    gripper_link_quads_2d=gripper_link_quads_2d,
+                    arm_link_segments_2d=arm_link_segments_2d,
+                    arm_link_name_pairs=arm_link_name_pairs,
+                    arm_link_quads_2d=arm_link_quads_2d,
                 )
 
         # --- (B) ACQUIRE/TRACK controller (Legacy continuous tracking) ---
@@ -837,6 +969,20 @@ class OnlinePatchDefenseController:
                 prac_stats=prac_stats_dict,
                 gripper_box=gripper_box,
                 arm_region_box=arm_region_box,
+                arm_core_box=arm_core_box,
+                arm_guard_box=arm_guard_box,
+                joint_points_2d=joint_points_2d,
+                joint_names_used=joint_names_used,
+                joint_points_render_2d=joint_points_render_2d,
+                gripper_points_2d=gripper_points_2d,
+                gripper_points_render_2d=gripper_points_render_2d,
+                gripper_point_keys_used=gripper_point_keys_used,
+                gripper_link_segments_2d=gripper_link_segments_2d,
+                gripper_link_name_pairs=gripper_link_name_pairs,
+                gripper_link_quads_2d=gripper_link_quads_2d,
+                arm_link_segments_2d=arm_link_segments_2d,
+                arm_link_name_pairs=arm_link_name_pairs,
+                arm_link_quads_2d=arm_link_quads_2d,
             )
 
         # --- (C0) map ROI grid -> pixel PatchBox early (needed for heatmap-space quality gate) ---
@@ -952,6 +1098,20 @@ class OnlinePatchDefenseController:
                 gripper_box=gripper_box,
                 patch_verdict=None,
                 arm_region_box=arm_region_box,
+                arm_core_box=arm_core_box,
+                arm_guard_box=arm_guard_box,
+                joint_points_2d=joint_points_2d,
+                joint_names_used=joint_names_used,
+                joint_points_render_2d=joint_points_render_2d,
+                gripper_points_2d=gripper_points_2d,
+                gripper_points_render_2d=gripper_points_render_2d,
+                gripper_point_keys_used=gripper_point_keys_used,
+                gripper_link_segments_2d=gripper_link_segments_2d,
+                gripper_link_name_pairs=gripper_link_name_pairs,
+                gripper_link_quads_2d=gripper_link_quads_2d,
+                arm_link_segments_2d=arm_link_segments_2d,
+                arm_link_name_pairs=arm_link_name_pairs,
+                arm_link_quads_2d=arm_link_quads_2d,
             )
             # Enter TRACK
             self._tracking = True
@@ -1051,6 +1211,20 @@ class OnlinePatchDefenseController:
             gripper_box=gripper_box,
             patch_verdict=None,
             arm_region_box=arm_region_box,
+            arm_core_box=arm_core_box,
+            arm_guard_box=arm_guard_box,
+            joint_points_2d=joint_points_2d,
+            joint_names_used=joint_names_used,
+            joint_points_render_2d=joint_points_render_2d,
+            gripper_points_2d=gripper_points_2d,
+            gripper_points_render_2d=gripper_points_render_2d,
+            gripper_point_keys_used=gripper_point_keys_used,
+            gripper_link_segments_2d=gripper_link_segments_2d,
+            gripper_link_name_pairs=gripper_link_name_pairs,
+            gripper_link_quads_2d=gripper_link_quads_2d,
+            arm_link_segments_2d=arm_link_segments_2d,
+            arm_link_name_pairs=arm_link_name_pairs,
+            arm_link_quads_2d=arm_link_quads_2d,
         )
 
 
@@ -1091,8 +1265,22 @@ class UnifiedDefenseResult:
     # New geometric prior fields
     gripper_box: Optional[PatchBox] = None
     patch_verdict: Optional[str] = None
-    # Arm region (x0,y0,x1,y1) for visualization when GripperPrior arm_extend_px > 0
+    # Aggregate arm guard box kept for compatibility / fallback visualization.
     arm_region_box: Optional[Tuple[int, int, int, int]] = None
+    arm_core_box: Optional[Tuple[int, int, int, int]] = None
+    arm_guard_box: Optional[Tuple[int, int, int, int]] = None
+    joint_points_2d: Optional[List[Tuple[int, int]]] = None
+    joint_names_used: Optional[List[str]] = None
+    joint_points_render_2d: Optional[List[Tuple[int, int]]] = None
+    gripper_points_2d: Optional[List[Tuple[int, int]]] = None
+    gripper_points_render_2d: Optional[List[Tuple[int, int]]] = None
+    gripper_point_keys_used: Optional[List[str]] = None
+    gripper_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+    gripper_link_name_pairs: Optional[List[Tuple[str, str]]] = None
+    gripper_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
+    arm_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+    arm_link_name_pairs: Optional[List[Tuple[str, str]]] = None
+    arm_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
 
 
 class UnifiedDefenseInterface:
@@ -1158,6 +1346,7 @@ class UnifiedDefenseInterface:
         heatmap_fn: Optional[Callable[[], np.ndarray]] = None,
         hm_current: Optional[np.ndarray] = None,
         eef_pos: Optional[np.ndarray] = None,
+        geometry_ctx: Optional[GeometryRuntimeContext] = None,
     ) -> UnifiedDefenseResult:
         """
         Args:
@@ -1210,6 +1399,7 @@ class UnifiedDefenseInterface:
             heatmap_fn=heatmap_fn,
             hm_current=hm_current,
             eef_pos=eef_pos,
+            geometry_ctx=geometry_ctx,
         )
         heatmap = self.hook.get_heatmap() if self.use_heatmap_for_viz else None
 
@@ -1233,4 +1423,18 @@ class UnifiedDefenseInterface:
             gripper_box=getattr(dd, "gripper_box", None),
             patch_verdict=getattr(dd, "patch_verdict", None),
             arm_region_box=getattr(dd, "arm_region_box", None),
+            arm_core_box=getattr(dd, "arm_core_box", None),
+            arm_guard_box=getattr(dd, "arm_guard_box", None),
+            joint_points_2d=getattr(dd, "joint_points_2d", None),
+            joint_names_used=getattr(dd, "joint_names_used", None),
+            joint_points_render_2d=getattr(dd, "joint_points_render_2d", None),
+            gripper_points_2d=getattr(dd, "gripper_points_2d", None),
+            gripper_points_render_2d=getattr(dd, "gripper_points_render_2d", None),
+            gripper_point_keys_used=getattr(dd, "gripper_point_keys_used", None),
+            gripper_link_segments_2d=getattr(dd, "gripper_link_segments_2d", None),
+            gripper_link_name_pairs=getattr(dd, "gripper_link_name_pairs", None),
+            gripper_link_quads_2d=getattr(dd, "gripper_link_quads_2d", None),
+            arm_link_segments_2d=getattr(dd, "arm_link_segments_2d", None),
+            arm_link_name_pairs=getattr(dd, "arm_link_name_pairs", None),
+            arm_link_quads_2d=getattr(dd, "arm_link_quads_2d", None),
         )
