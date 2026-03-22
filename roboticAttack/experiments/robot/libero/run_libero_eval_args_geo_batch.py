@@ -164,22 +164,26 @@ def _make_overlay_rgb(image_rgb, heatmap, alpha: float):
         hm_u8 = _normalize_heatmap_uint8(heatmap)
         return np.stack([hm_u8, hm_u8, hm_u8], axis=-1)
 
-def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"], gripper_box=None):
+def _maybe_pack_replay_frame(cfg, image_rgb, heatmap: Optional["np.ndarray"], gripper_box=None, arm_region_box=None):
     """Optionally concatenate the policy input and heatmap overlay side-by-side."""
     # If a gripper box is provided, draw it on the image_rgb (and overlay if created)
     img_to_pack = image_rgb.copy()
-    if gripper_box is not None:
-        try:
-            import cv2
+    try:
+        import cv2
+        if gripper_box is not None:
             # Draw a green bounding box for the gripper prior
             cv2.rectangle(
-                img_to_pack, 
-                (int(gripper_box.x0), int(gripper_box.y0)), 
-                (int(gripper_box.x1), int(gripper_box.y1)), 
+                img_to_pack,
+                (int(gripper_box.x0), int(gripper_box.y0)),
+                (int(gripper_box.x1), int(gripper_box.y1)),
                 (0, 255, 0), 2
             )
-        except Exception:
-            pass
+        if arm_region_box is not None:
+            # Draw a blue bounding box for the arm region (for verification)
+            x0, y0, x1, y1 = arm_region_box
+            cv2.rectangle(img_to_pack, (int(x0), int(y0)), (int(x1), int(y1)), (255, 0, 0), 2)
+    except Exception:
+        pass
 
     if not getattr(cfg, "defense_viz", False):
         return img_to_pack
@@ -366,12 +370,26 @@ def eval_libero(cfg) -> None:
             patch_selector = None
             if getattr(cfg, "defense_gripper_prior_enabled", True):
                 gp_cfg = GripperPriorConfig(
-                    radius_px=getattr(cfg, "defense_gripper_radius_px", 40)
+                    radius_px=getattr(cfg, "defense_gripper_radius_px", 40),
+                    cam_fx=getattr(cfg, "defense_gripper_cam_fx", 100.0),
+                    cam_fy=getattr(cfg, "defense_gripper_cam_fy", 100.0),
+                    cam_cx=getattr(cfg, "defense_gripper_cam_cx", 128.0),
+                    cam_cy=getattr(cfg, "defense_gripper_cam_cy", 128.0),
+                    offset_x=getattr(cfg, "defense_gripper_offset_x", 0.0),
+                    offset_y=getattr(cfg, "defense_gripper_offset_y", 0.0),
+                    proj_u_axis=getattr(cfg, "defense_gripper_proj_u_axis", "y"),
+                    proj_v_axis=getattr(cfg, "defense_gripper_proj_v_axis", "z"),
+                    sign_u=int(getattr(cfg, "defense_gripper_sign_u", -1)),
+                    sign_v=int(getattr(cfg, "defense_gripper_sign_v", -1)),
+                    arm_orientation=getattr(cfg, "defense_arm_orientation", "vertical"),
+                    arm_extend_px=getattr(cfg, "defense_arm_extend_px", 0),
+                    arm_extend_ortho_px=getattr(cfg, "defense_arm_extend_ortho_px", 20),
                 )
                 gripper_prior = GripperPrior(gp_cfg)
                 
                 ps_cfg = PatchSelectorConfig(
                     tau_g=getattr(cfg, "defense_tau_g", 0.3),
+                    tau_arm=getattr(cfg, "defense_tau_arm", 0.3),
                     tau_patch_strength=getattr(cfg, "defense_tau_patch_strength", 0.05)
                 )
                 patch_selector = PatchSelector(ps_cfg)
@@ -546,6 +564,7 @@ def eval_libero(cfg) -> None:
                     # Unified defense step (works for both known and auto modes)
                     heatmap_for_viz = None
                     gripper_box_for_viz = None
+                    arm_region_box_for_viz = None
                     if defense_interface is not None:
                         try:
                             # Extract EEF pos for Multimodal Geometric Prior
@@ -578,10 +597,11 @@ def eval_libero(cfg) -> None:
                             log_file.close()
                             sys.exit(1)
                         
-                        # Get heatmap and gripper box for visualization
+                        # Get heatmap, gripper box, and arm region for visualization
                         if getattr(cfg, "defense_viz", False):
                             heatmap_for_viz = defense_result.heatmap
                             gripper_box_for_viz = getattr(defense_result, "gripper_box", None)
+                        arm_region_box_for_viz = getattr(defense_result, "arm_region_box", None)
                         
                         # Statistics (new semantics)
                         dlog = defense_result_to_log_dict(defense_result)
@@ -631,8 +651,12 @@ def eval_libero(cfg) -> None:
 
                     # Save replay frame:
                     # - default: policy input image
-                    # - optional: side-by-side with real-time heatmap overlay
-                    replay_images.append(_maybe_pack_replay_frame(cfg, img_for_policy, heatmap_for_viz, gripper_box_for_viz))
+                    # - optional: side-by-side with real-time heatmap overlay; green=gripper, blue=arm region
+                    replay_images.append(_maybe_pack_replay_frame(
+                        cfg, img_for_policy, heatmap_for_viz,
+                        gripper_box=gripper_box_for_viz,
+                        arm_region_box=arm_region_box_for_viz,
+                    ))
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -659,6 +683,12 @@ def eval_libero(cfg) -> None:
             total_episodes += 1
 
             # Save a replay video of the episode
+            # When rollout_per_task_dir is True: save under rollout_root_dir / exp_name / task{N}_suffix / DATE (e.g. clean_baseline/task0_no_attack_no_defense/2026_03_07/)
+            if getattr(cfg, "rollout_per_task_dir", False):
+                task_suffix = getattr(cfg, "exp_name_task_suffix", "_no_attack_no_defense")
+                exp_name_save = os.path.join(cfg.exp_name, f"task{task_id}{task_suffix}")
+            else:
+                exp_name_save = cfg.exp_name
             print(f"Saving replay video...")
             save_rollout_video(
                 replay_images,
@@ -666,7 +696,7 @@ def eval_libero(cfg) -> None:
                 success=done,
                 task_description=task_description,
                 log_file=log_file,
-                exp_name=cfg.exp_name,
+                exp_name=exp_name_save,
                 rollout_root_dir=getattr(cfg, "rollout_root_dir", "./rollouts"),
             )
             _defense_debug_print(
@@ -764,6 +794,8 @@ def parse_args():
     parser.add_argument("--run_id_note", type=str, default=f"test_libero_object", help="Extra note to add in run ID for logging")
     parser.add_argument("--local_log_dir", type=str, default="./experiments/logs", help="Local directory for eval logs")
     parser.add_argument("--rollout_root_dir", type=str, default="./rollouts", help="Root directory for saving rollout videos.")
+    parser.add_argument("--rollout_per_task_dir", type=str2bool, default=False, help="If True, save videos under exp_name/task{N}_suffix/DATE so each task has its own folder (e.g. clean_baseline/task0_no_attack_no_defense/2026_03_07/).")
+    parser.add_argument("--exp_name_task_suffix", type=str, default="_no_attack_no_defense", help="Suffix for per-task folder when rollout_per_task_dir is True (e.g. task0_no_attack_no_defense).")
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Whether to also log results in Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="LIBERO_simulation_test", help="Name of W&B project to log to (use default!)")
     parser.add_argument("--wandb_entity", type=str, default="taowen_wang-rit", help="Name of entity to log under")
@@ -832,11 +864,27 @@ def parse_args():
     
     # Multimodal Gripper Prior & Patch Selector parameters
     parser.add_argument("--defense_gripper_prior_enabled", type=str2bool, default=True, help="Enable multimodal geometric gripper prior.")
-    parser.add_argument("--defense_gripper_radius_px", type=int, default=40, help="Radius in pixels for the gripper protection zone.")
+    parser.add_argument("--defense_gripper_radius_px", type=int, default=40, help="Radius in pixels for the gripper protection zone (increase if green box too small).")
+    parser.add_argument("--defense_gripper_cam_fx", type=float, default=100.0, help="Gripper projection scale for horizontal (u).")
+    parser.add_argument("--defense_gripper_cam_fy", type=float, default=100.0, help="Gripper projection scale for vertical (v).")
+    parser.add_argument("--defense_gripper_cam_cx", type=float, default=128.0, help="Gripper projection center u (image center).")
+    parser.add_argument("--defense_gripper_cam_cy", type=float, default=128.0, help="Gripper projection center v (image center).")
+    parser.add_argument("--defense_gripper_offset_x", type=float, default=0.0, help="Gripper box horizontal offset in pixels (tune so green box centers on gripper).")
+    parser.add_argument("--defense_gripper_offset_y", type=float, default=0.0, help="Gripper box vertical offset in pixels.")
+    parser.add_argument("--defense_gripper_proj_u_axis", type=str, default="y", choices=["x", "y"], help="World axis for image u: x or y (try x if green box horizontally off).")
+    parser.add_argument("--defense_gripper_proj_v_axis", type=str, default="z", choices=["z", "y"], help="World axis for image v: z or y.")
+    parser.add_argument("--defense_gripper_sign_u", type=int, default=-1, choices=[-1, 1], help="Sign for u projection (-1 or 1).")
+    parser.add_argument("--defense_gripper_sign_v", type=int, default=-1, choices=[-1, 1], help="Sign for v projection (-1 or 1).")
     parser.add_argument("--defense_tau_g", type=float, default=0.3, help="Overlap threshold with GripperPrior for PatchSelector.")
+    parser.add_argument("--defense_tau_arm", type=float, default=0.3, help="Overlap threshold with arm region for PatchSelector (when arm_extend_px>0).")
     parser.add_argument("--defense_tau_patch_strength", type=float, default=0.05, help="Minimum anomaly mass for PatchSelector.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
+    # Arm region (extend G_px toward arm base for visualization and future PatchSelector use)
+    parser.add_argument("--defense_arm_orientation", type=str, default="vertical", choices=["vertical", "horizontal"],
+                        help="Arm mounting: vertical = arm above gripper (smaller y); horizontal = arm left/right.")
+    parser.add_argument("--defense_arm_extend_px", type=int, default=0, help="Pixels to extend G_px toward arm base; 0 = disabled.")
+    parser.add_argument("--defense_arm_extend_ortho_px", type=int, default=20, help="Perpendicular extension for arm band (pixels).")
 
     # PRAC checker parameters
     parser.add_argument("--defense_prac_enabled", type=str2bool, default=True, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")

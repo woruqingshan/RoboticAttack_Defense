@@ -286,6 +286,8 @@ class DefenseDecision:
     # New geometric prior fields
     gripper_box: Optional[PatchBox] = None
     patch_verdict: Optional[str] = None  # "NO_PATCH" | "PATCH_FOUND" | "NEAR_TASK_PATCH"
+    # Arm region (pixel box (x0,y0,x1,y1)) for visualization; from GripperPrior when arm_extend_px > 0
+    arm_region_box: Optional[Tuple[int, int, int, int]] = None
 
 
 class OnlinePatchDefenseController:
@@ -443,7 +445,9 @@ class OnlinePatchDefenseController:
         # --- Multimodal Geometric Prior (Step 0) ---
         G_px = None
         G_grid = None
+        arm_region_grid: Optional[GridBox] = None
         gripper_box = None
+        arm_region_box: Optional[Tuple[int, int, int, int]] = None
         img_shape = (256, 256)
         if image is not None:
             img_shape = image.shape[:2]
@@ -451,9 +455,10 @@ class OnlinePatchDefenseController:
             img_shape = hm_current.shape[:2]
         
         if self.gripper_prior is not None and eef_pos is not None:
-            g_px_tuple, G_grid = self.gripper_prior.compute(eef_pos, img_shape, grid.shape)
+            g_px_tuple, G_grid, arm_region_px, arm_region_grid = self.gripper_prior.compute(eef_pos, img_shape, grid.shape)
             G_px = PatchBox(x0=g_px_tuple[0], y0=g_px_tuple[1], x1=g_px_tuple[2], y1=g_px_tuple[3])
             gripper_box = G_px
+            arm_region_box = arm_region_px  # (x0,y0,x1,y1) for visualization
 
         # ---------------------------------------------------------------------
         # LOCKED MODE (Multimodal or PRAC):
@@ -517,6 +522,7 @@ class OnlinePatchDefenseController:
                 prac_stats=None,
                 gripper_box=gripper_box,
                 patch_verdict=getattr(self, "_locked_patch_verdict", "PATCH_FOUND"),
+                arm_region_box=arm_region_box,
             )
 
         if not bool(self._locked):
@@ -530,9 +536,11 @@ class OnlinePatchDefenseController:
             best_reason: str = "lock_no_candidate"
             patch_verdict_str = "NO_PATCH"
 
-            # Step 2: PatchSelector
+            # Step 2: PatchSelector (filter by G_grid and optionally arm_region_grid)
             if self.patch_selector is not None and G_grid is not None:
-                ps_res = self.patch_selector.select(top_k_candidates, G_grid)
+                ps_res = self.patch_selector.select(
+                    top_k_candidates, G_grid, arm_region_grid=arm_region_grid
+                )
                 patch_verdict_str = ps_res.verdict
                 best_roi = ps_res.roi
                 best_reason = ps_res.reason
@@ -567,6 +575,7 @@ class OnlinePatchDefenseController:
                         prac_stats=None,
                         gripper_box=gripper_box,
                         patch_verdict=patch_verdict_str,
+                        arm_region_box=arm_region_box,
                     )
             else:
                 # Fallback: Top-1
@@ -636,6 +645,7 @@ class OnlinePatchDefenseController:
                     prac_stats=None,
                     gripper_box=gripper_box,
                     patch_verdict=patch_verdict_str,
+                    arm_region_box=arm_region_box,
                 )
 
         # --- (B) ACQUIRE/TRACK controller (Legacy continuous tracking) ---
@@ -825,6 +835,8 @@ class OnlinePatchDefenseController:
                 prac_odr=prac_odr,
                 prac_mer=prac_mer,
                 prac_stats=prac_stats_dict,
+                gripper_box=gripper_box,
+                arm_region_box=arm_region_box,
             )
 
         # --- (C0) map ROI grid -> pixel PatchBox early (needed for heatmap-space quality gate) ---
@@ -939,6 +951,7 @@ class OnlinePatchDefenseController:
                 prac_stats=prac_stats_dict,
                 gripper_box=gripper_box,
                 patch_verdict=None,
+                arm_region_box=arm_region_box,
             )
             # Enter TRACK
             self._tracking = True
@@ -1037,6 +1050,7 @@ class OnlinePatchDefenseController:
             prac_stats=prac_stats_dict,
             gripper_box=gripper_box,
             patch_verdict=None,
+            arm_region_box=arm_region_box,
         )
 
 
@@ -1077,6 +1091,8 @@ class UnifiedDefenseResult:
     # New geometric prior fields
     gripper_box: Optional[PatchBox] = None
     patch_verdict: Optional[str] = None
+    # Arm region (x0,y0,x1,y1) for visualization when GripperPrior arm_extend_px > 0
+    arm_region_box: Optional[Tuple[int, int, int, int]] = None
 
 
 class UnifiedDefenseInterface:
@@ -1216,4 +1232,5 @@ class UnifiedDefenseInterface:
             heatmap=heatmap,
             gripper_box=getattr(dd, "gripper_box", None),
             patch_verdict=getattr(dd, "patch_verdict", None),
+            arm_region_box=getattr(dd, "arm_region_box", None),
         )
