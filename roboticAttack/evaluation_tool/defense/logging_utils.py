@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
 
 from .geometry_alignment import points_rc_to_xyxy_box
+from .mask_metrics import summarize_mask
 
 
 def _box_to_dict(box: Any) -> Optional[Dict[str, int]]:
@@ -42,6 +43,9 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
     base["arm_region_box"] = _box_to_dict(getattr(result, "arm_region_box", None))
     base["arm_core_box"] = _box_to_dict(getattr(result, "arm_core_box", None))
     base["arm_guard_box"] = _box_to_dict(getattr(result, "arm_guard_box", None))
+    base["roi_mask_stats"] = summarize_mask(getattr(result, "roi_mask", None))
+    # Keep logs JSON-safe: drop raw ndarray payload.
+    base.pop("roi_mask", None)
 
     # Ensure commonly used keys exist (avoid KeyError in scripts).
     for k in [
@@ -82,6 +86,10 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
         "arm_link_name_pairs",
         "arm_link_segments_2d",
         "arm_link_quads_2d",
+        "roi_mask_stats",
+        "conflict_mode",
+        "conflict_reason",
+        "conflict_stats",
     ]:
         base.setdefault(k, None)
 
@@ -115,6 +123,10 @@ def format_defense_log_line(step: int, result: Any) -> str:
     
     if d.get("patch_verdict"):
         parts.append(f"patch={d.get('patch_verdict')}")
+    if d.get("roi_mask_stats") is not None:
+        parts.append(f"mask_area={d.get('roi_mask_stats', {}).get('area', 0)}")
+    if d.get("conflict_mode"):
+        parts.append(f"conflict={d.get('conflict_mode')}")
     if d.get("arm_core_box") is not None:
         parts.append(f"arm_core={d.get('arm_core_box')}")
     if d.get("arm_guard_box") is not None:
@@ -143,6 +155,9 @@ def format_defense_log_line(step: int, result: Any) -> str:
     reason = d.get("reason")
     if isinstance(reason, str) and reason:
         parts.append(f"reason={reason}")
+    conflict_reason = d.get("conflict_reason")
+    if isinstance(conflict_reason, str) and conflict_reason:
+        parts.append(f"conflict_reason={conflict_reason}")
     return " | ".join(parts)
 
 

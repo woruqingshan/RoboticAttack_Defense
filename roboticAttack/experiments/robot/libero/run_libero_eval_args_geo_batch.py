@@ -115,6 +115,12 @@ from evaluation_tool.defense import (
     GeometryRuntimeContext,
     PatchSelector,
     PatchSelectorConfig,
+    SafetyRegionConfig,
+    SafetyRegionBuilder,
+    PixelMaskRefinerConfig,
+    PixelMaskRefiner,
+    TemporalConflictConfig,
+    TemporalConflictResolver,
 )
 
 # PRAC checker (optional import)
@@ -430,6 +436,9 @@ def eval_libero(cfg) -> None:
             gripper_prior = None
             arm_skeleton_prior = None
             patch_selector = None
+            safety_region_builder = None
+            pixel_mask_refiner = None
+            temporal_conflict_resolver = None
             if getattr(cfg, "defense_gripper_prior_enabled", True):
                 gp_cfg = GripperPriorConfig(
                     enabled=True,
@@ -485,6 +494,39 @@ def eval_libero(cfg) -> None:
                 )
                 patch_selector = PatchSelector(ps_cfg)
 
+            if getattr(cfg, "defense_safety_region_enabled", True):
+                sr_cfg = SafetyRegionConfig(
+                    w_arm_core=float(getattr(cfg, "defense_safety_w_arm_core", 1.0)),
+                    w_arm_guard=float(getattr(cfg, "defense_safety_w_arm_guard", 0.6)),
+                    w_gripper_core=float(getattr(cfg, "defense_safety_w_gripper_core", 1.0)),
+                    w_gripper_guard=float(getattr(cfg, "defense_safety_w_gripper_guard", 0.7)),
+                    smooth_kernel=int(getattr(cfg, "defense_safety_smooth_kernel", 0)),
+                )
+                safety_region_builder = SafetyRegionBuilder(sr_cfg)
+
+            if getattr(cfg, "defense_pixel_mask_refine_enabled", True):
+                pm_cfg = PixelMaskRefinerConfig(
+                    lambda_safety=float(getattr(cfg, "defense_pixel_lambda_safety", 0.75)),
+                    score_quantile=float(getattr(cfg, "defense_pixel_score_quantile", 0.65)),
+                    min_area_ratio=float(getattr(cfg, "defense_pixel_min_area_ratio", 0.08)),
+                    min_cover_ratio=float(getattr(cfg, "defense_pixel_min_cover_ratio", 0.40)),
+                    keep_largest_component=bool(getattr(cfg, "defense_pixel_keep_largest_component", True)),
+                    hard_forbid_core=bool(getattr(cfg, "defense_pixel_hard_forbid_core", True)),
+                )
+                pixel_mask_refiner = PixelMaskRefiner(pm_cfg)
+
+            if getattr(cfg, "defense_temporal_conflict_enabled", True):
+                tc_cfg = TemporalConflictConfig(
+                    core_hard_on=float(getattr(cfg, "defense_conflict_core_hard_on", 0.10)),
+                    core_hard_off=float(getattr(cfg, "defense_conflict_core_hard_off", 0.04)),
+                    guard_soft_on=float(getattr(cfg, "defense_conflict_guard_soft_on", 0.25)),
+                    guard_soft_off=float(getattr(cfg, "defense_conflict_guard_soft_off", 0.12)),
+                    hard_on_frames=int(getattr(cfg, "defense_conflict_hard_on_frames", 2)),
+                    soft_on_frames=int(getattr(cfg, "defense_conflict_soft_on_frames", 2)),
+                    soft_alpha=float(getattr(cfg, "defense_conflict_soft_alpha", 0.7)),
+                )
+                temporal_conflict_resolver = TemporalConflictResolver(tc_cfg)
+
             controller = OnlinePatchDefenseController(
                 hook=defense_hook,
                 localizer=localizer,
@@ -500,6 +542,9 @@ def eval_libero(cfg) -> None:
                 prac_enabled=getattr(cfg, "defense_prac_enabled", True),  # Default: enabled if prac_checker is provided
                 gripper_prior=gripper_prior,
                 arm_skeleton_prior=arm_skeleton_prior,
+                safety_region_builder=safety_region_builder,
+                pixel_mask_refiner=pixel_mask_refiner,
+                temporal_conflict_resolver=temporal_conflict_resolver,
                 patch_selector=patch_selector,
                 tau_protect=getattr(cfg, "defense_tau_protect", 0.1),
                 tau_cover=getattr(cfg, "defense_tau_cover", 0.5),
@@ -745,15 +790,23 @@ def eval_libero(cfg) -> None:
                                 _defense_debug_print(cfg, geom_line, log_file=log_file)
                         
                         # Check if purification is needed (unified field)
-                        if defense_result.should_purify and defense_result.roi_box is not None:
+                        roi_mask = getattr(defense_result, "roi_mask", None)
+                        if defense_result.should_purify and (roi_mask is not None or defense_result.roi_box is not None):
                             
                             # Purify image (unified interface)
                             # Use strength from defense_result if available (auto mode provides dynamic strength)
-                            img_for_policy = defense_purifier.purify(
-                                img_for_policy,
-                                defense_result.roi_box,
-                                strength=getattr(defense_result, "strength", None),  # Use dynamic strength if available
-                            )
+                            if isinstance(roi_mask, np.ndarray):
+                                img_for_policy = defense_purifier.purify_with_mask(
+                                    img_for_policy,
+                                    roi_mask,
+                                    strength=getattr(defense_result, "strength", None),
+                                )
+                            else:
+                                img_for_policy = defense_purifier.purify(
+                                    img_for_policy,
+                                    defense_result.roi_box,
+                                    strength=getattr(defense_result, "strength", None),  # Use dynamic strength if available
+                                )
                             
                             # Recompute action on purified image
                             observation["full_image"] = img_for_policy
@@ -1022,6 +1075,33 @@ def parse_args():
     # Controller (quality aligned with heatmap)
     parser.add_argument("--defense_min_trigger_mass_heatmap", type=float, default=0.02, help="Min ROI mass on heatmap to allow trigger (auto mode).")
     parser.add_argument("--defense_quality_mass_source", type=str, default="heatmap", choices=["heatmap", "grid"], help="Mass source for quality gate (auto mode).")
+
+    # Safety Region Layer
+    parser.add_argument("--defense_safety_region_enabled", type=str2bool, default=True, help="Enable safety region fusion layer.")
+    parser.add_argument("--defense_safety_w_arm_core", type=float, default=1.0, help="Penalty weight for arm core region.")
+    parser.add_argument("--defense_safety_w_arm_guard", type=float, default=0.6, help="Penalty weight for arm guard region.")
+    parser.add_argument("--defense_safety_w_gripper_core", type=float, default=1.0, help="Penalty weight for gripper core region.")
+    parser.add_argument("--defense_safety_w_gripper_guard", type=float, default=0.7, help="Penalty weight for gripper guard region.")
+    parser.add_argument("--defense_safety_smooth_kernel", type=int, default=0, help="Optional smoothing kernel size for penalty map (0 disables).")
+
+    # Pixel Mask Optimizer Layer
+    parser.add_argument("--defense_pixel_mask_refine_enabled", type=str2bool, default=True, help="Enable pixel-level mask refinement.")
+    parser.add_argument("--defense_pixel_lambda_safety", type=float, default=0.75, help="Safety penalty coefficient in pixel score.")
+    parser.add_argument("--defense_pixel_score_quantile", type=float, default=0.65, help="Score quantile threshold for mask binarization.")
+    parser.add_argument("--defense_pixel_min_area_ratio", type=float, default=0.08, help="Minimum selected pixel ratio in ROI.")
+    parser.add_argument("--defense_pixel_min_cover_ratio", type=float, default=0.40, help="Minimum heatmap coverage ratio in ROI.")
+    parser.add_argument("--defense_pixel_keep_largest_component", type=str2bool, default=True, help="Keep largest connected component in refined mask.")
+    parser.add_argument("--defense_pixel_hard_forbid_core", type=str2bool, default=True, help="Disallow selecting core safety pixels during mask refinement.")
+
+    # Temporal Conflict Layer
+    parser.add_argument("--defense_temporal_conflict_enabled", type=str2bool, default=True, help="Enable temporal conflict resolver.")
+    parser.add_argument("--defense_conflict_core_hard_on", type=float, default=0.10, help="Core-overlap threshold to enter HARD mode.")
+    parser.add_argument("--defense_conflict_core_hard_off", type=float, default=0.04, help="Core-overlap threshold to exit HARD mode.")
+    parser.add_argument("--defense_conflict_guard_soft_on", type=float, default=0.25, help="Guard-overlap threshold to enter SOFT mode.")
+    parser.add_argument("--defense_conflict_guard_soft_off", type=float, default=0.12, help="Guard-overlap threshold to exit SOFT mode.")
+    parser.add_argument("--defense_conflict_hard_on_frames", type=int, default=2, help="Consecutive frames required to trigger HARD conflict.")
+    parser.add_argument("--defense_conflict_soft_on_frames", type=int, default=2, help="Consecutive frames required to trigger SOFT conflict.")
+    parser.add_argument("--defense_conflict_soft_alpha", type=float, default=0.7, help="Strength scale applied under SOFT conflict mode.")
     
     # Multimodal Gripper Prior & Patch Selector parameters
     parser.add_argument("--defense_gripper_prior_enabled", type=str2bool, default=True, help="Enable multimodal geometric gripper prior.")

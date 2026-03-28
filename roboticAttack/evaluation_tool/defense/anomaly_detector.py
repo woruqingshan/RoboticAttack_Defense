@@ -45,6 +45,9 @@ from .verifier import VerifierProtocol, roi_mass as heatmap_roi_mass, refine_mas
 from .gripper_prior import GripperPrior
 from .arm_skeleton_prior import ArmSkeletonPrior, GeometryRuntimeContext
 from .patch_selector import PatchSelector
+from .safety_region import SafetyRegionBuilder
+from .pixel_mask_refiner import PixelMaskRefiner
+from .temporal_conflict import TemporalConflictResolver
 
 # PRAC checker (optional import to avoid circular dependency)
 try:
@@ -303,6 +306,10 @@ class DefenseDecision:
     arm_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
     arm_link_name_pairs: Optional[List[Tuple[str, str]]] = None
     arm_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
+    roi_mask: Optional[np.ndarray] = None
+    conflict_mode: Optional[str] = None
+    conflict_reason: str = ""
+    conflict_stats: Optional[dict] = None
 
 
 class OnlinePatchDefenseController:
@@ -345,6 +352,9 @@ class OnlinePatchDefenseController:
         # Multimodal prior and selector
         gripper_prior: Optional[GripperPrior] = None,
         arm_skeleton_prior: Optional[ArmSkeletonPrior] = None,
+        safety_region_builder: Optional[SafetyRegionBuilder] = None,
+        pixel_mask_refiner: Optional[PixelMaskRefiner] = None,
+        temporal_conflict_resolver: Optional[TemporalConflictResolver] = None,
         patch_selector: Optional[PatchSelector] = None,
         tau_protect: float = 0.1,  # Maximum allowed overlap ratio with G_px
         tau_cover: float = 0.5,    # Minimum required coverage ratio of original ROI
@@ -379,6 +389,9 @@ class OnlinePatchDefenseController:
         # Multimodal prior
         self.gripper_prior = gripper_prior
         self.arm_skeleton_prior = arm_skeleton_prior
+        self.safety_region_builder = safety_region_builder
+        self.pixel_mask_refiner = pixel_mask_refiner
+        self.temporal_conflict_resolver = temporal_conflict_resolver
         self.patch_selector = patch_selector
         self.tau_protect = float(tau_protect)
         self.tau_cover = float(tau_cover)
@@ -493,6 +506,10 @@ class OnlinePatchDefenseController:
         elif hm_current is not None:
             img_shape = hm_current.shape[:2]
         
+        gripper_res = None
+        skeleton_res = None
+        safety_bundle = None
+
         if self.gripper_prior is not None and geometry_ctx is not None:
             gripper_res = self.gripper_prior.compute(geometry_ctx, grid.shape)
             if bool(gripper_res.valid) and gripper_res.gripper_guard_box_px is not None and gripper_res.gripper_guard_grid is not None:
@@ -540,6 +557,24 @@ class OnlinePatchDefenseController:
                 if arm_guard_box is not None:
                     arm_region_box = arm_guard_box
 
+        if self.safety_region_builder is not None:
+            safety_bundle = self.safety_region_builder.build(
+                policy_hw=img_shape,
+                gripper_res=gripper_res,
+                arm_res=skeleton_res,
+                grid_shape=grid.shape,
+            )
+            if bool(safety_bundle.valid):
+                # Feed bundle back into legacy variables so existing selector/refine paths keep working.
+                if gripper_core_grid_mask is None:
+                    gripper_core_grid_mask = safety_bundle.masks_grid.get("gripper_core", None)
+                if gripper_guard_grid_mask is None:
+                    gripper_guard_grid_mask = safety_bundle.masks_grid.get("gripper_guard", None)
+                if arm_core_grid_mask is None:
+                    arm_core_grid_mask = safety_bundle.masks_grid.get("arm_core", None)
+                if arm_guard_grid_mask is None:
+                    arm_guard_grid_mask = safety_bundle.masks_grid.get("arm_guard", None)
+
         # ---------------------------------------------------------------------
         # LOCKED MODE (Multimodal or PRAC):
         # - First step: localize + select best patch ROI, lock it.
@@ -550,6 +585,12 @@ class OnlinePatchDefenseController:
             main_grid_locked = self._locked_main_grid
             x0, y0, x1, y1 = roi_grid_locked.gx0, roi_grid_locked.gy0, roi_grid_locked.gx1, roi_grid_locked.gy1
             roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+            roi_mask = None
+            conflict_mode = None
+            conflict_reason = ""
+            conflict_stats = None
+            should_purify_locked = True
+            strength_locked = 1.0
 
             # --- Mask verification/refinement (Step 4) ---
             if G_px is not None:
@@ -560,6 +601,40 @@ class OnlinePatchDefenseController:
                     tau_cover=self.tau_cover
                 )
                 roi_box = PatchBox(x0=rx0, y0=ry0, x1=rx1, y1=ry1)
+
+            if self.pixel_mask_refiner is not None:
+                hm_for_refine = hm_current
+                if hm_for_refine is None and heatmap_fn is not None:
+                    try:
+                        hm_for_refine = heatmap_fn()
+                    except Exception:
+                        hm_for_refine = None
+                if hm_for_refine is not None:
+                    try:
+                        pmr = self.pixel_mask_refiner.refine(
+                            initial_roi_px=roi_box,
+                            heatmap=hm_for_refine,
+                            safety_bundle=safety_bundle,
+                        )
+                        if bool(pmr.valid) and pmr.tight_box_xyxy is not None:
+                            tx0, ty0, tx1, ty1 = pmr.tight_box_xyxy
+                            roi_box = PatchBox(x0=tx0, y0=ty0, x1=tx1, y1=ty1)
+                            roi_mask = pmr.mask_px
+                    except Exception:
+                        pass
+
+            if self.temporal_conflict_resolver is not None and roi_mask is not None:
+                try:
+                    tc = self.temporal_conflict_resolver.update(roi_mask=roi_mask, safety_bundle=safety_bundle)
+                    conflict_mode = tc.mode
+                    conflict_reason = tc.reason
+                    conflict_stats = dict(tc.stats)
+                    if str(tc.mode) == "HARD":
+                        should_purify_locked = False
+                    elif str(tc.mode) == "SOFT":
+                        strength_locked = float(np.clip(tc.alpha_scale, 0.0, 1.0))
+                except Exception:
+                    pass
 
             # Best-effort heatmap mass (for logging only; does not affect decision).
             mass_heatmap = None
@@ -575,7 +650,7 @@ class OnlinePatchDefenseController:
                     mass_heatmap = None
 
             return DefenseDecision(
-                should_purify=True,
+                should_purify=bool(should_purify_locked),
                 roi_box=roi_box,
                 grid_box=roi_grid_locked,
                 main_grid_box=main_grid_locked,
@@ -584,7 +659,7 @@ class OnlinePatchDefenseController:
                 raw_mass=1.0,
                 state="LOCKED",
                 reason="locked_force_purify",
-                strength=1.0,  # Full purification strength.
+                strength=float(strength_locked),
                 verified=None,
                 verify_stats=None,
                 mass_heatmap=mass_heatmap,
@@ -617,6 +692,10 @@ class OnlinePatchDefenseController:
                 arm_link_segments_2d=arm_link_segments_2d,
                 arm_link_name_pairs=arm_link_name_pairs,
                 arm_link_quads_2d=arm_link_quads_2d,
+                roi_mask=roi_mask,
+                conflict_mode=conflict_mode,
+                conflict_reason=str(conflict_reason),
+                conflict_stats=conflict_stats,
             )
 
         if not bool(self._locked):
@@ -712,6 +791,12 @@ class OnlinePatchDefenseController:
                 # Return the forced purify decision immediately.
                 x0, y0, x1, y1 = best_roi.gx0, best_roi.gy0, best_roi.gx1, best_roi.gy1
                 roi_box = self.hook.grid_bbox_to_patch_box(int(x0), int(y0), int(x1), int(y1))
+                roi_mask = None
+                conflict_mode = None
+                conflict_reason = ""
+                conflict_stats = None
+                should_purify_locked = True
+                strength_locked = 1.0
 
                 # Step 4: Mask Verification/Refinement
                 if G_px is not None:
@@ -722,6 +807,40 @@ class OnlinePatchDefenseController:
                         tau_cover=self.tau_cover
                     )
                     roi_box = PatchBox(x0=rx0, y0=ry0, x1=rx1, y1=ry1)
+
+                if self.pixel_mask_refiner is not None:
+                    hm_for_refine = hm_current
+                    if hm_for_refine is None and heatmap_fn is not None:
+                        try:
+                            hm_for_refine = heatmap_fn()
+                        except Exception:
+                            hm_for_refine = None
+                    if hm_for_refine is not None:
+                        try:
+                            pmr = self.pixel_mask_refiner.refine(
+                                initial_roi_px=roi_box,
+                                heatmap=hm_for_refine,
+                                safety_bundle=safety_bundle,
+                            )
+                            if bool(pmr.valid) and pmr.tight_box_xyxy is not None:
+                                tx0, ty0, tx1, ty1 = pmr.tight_box_xyxy
+                                roi_box = PatchBox(x0=tx0, y0=ty0, x1=tx1, y1=ty1)
+                                roi_mask = pmr.mask_px
+                        except Exception:
+                            pass
+
+                if self.temporal_conflict_resolver is not None and roi_mask is not None:
+                    try:
+                        tc = self.temporal_conflict_resolver.update(roi_mask=roi_mask, safety_bundle=safety_bundle)
+                        conflict_mode = tc.mode
+                        conflict_reason = tc.reason
+                        conflict_stats = dict(tc.stats)
+                        if str(tc.mode) == "HARD":
+                            should_purify_locked = False
+                        elif str(tc.mode) == "SOFT":
+                            strength_locked = float(np.clip(tc.alpha_scale, 0.0, 1.0))
+                    except Exception:
+                        pass
 
                 mass_heatmap = None
                 if hm_current is not None:
@@ -736,7 +855,7 @@ class OnlinePatchDefenseController:
                         pass
 
                 return DefenseDecision(
-                    should_purify=True,
+                    should_purify=bool(should_purify_locked),
                     roi_box=roi_box,
                     grid_box=best_roi,
                     main_grid_box=tlr.main_roi,
@@ -745,7 +864,7 @@ class OnlinePatchDefenseController:
                     raw_mass=1.0,
                     state="LOCKED",
                     reason=best_reason,
-                    strength=1.0,
+                    strength=float(strength_locked),
                     verified=None,
                     verify_stats=None,
                     mass_heatmap=mass_heatmap,
@@ -778,6 +897,10 @@ class OnlinePatchDefenseController:
                     arm_link_segments_2d=arm_link_segments_2d,
                     arm_link_name_pairs=arm_link_name_pairs,
                     arm_link_quads_2d=arm_link_quads_2d,
+                    roi_mask=roi_mask,
+                    conflict_mode=conflict_mode,
+                    conflict_reason=str(conflict_reason),
+                    conflict_stats=conflict_stats,
                 )
 
         # --- (B) ACQUIRE/TRACK controller (Legacy continuous tracking) ---
@@ -1281,6 +1404,10 @@ class UnifiedDefenseResult:
     arm_link_segments_2d: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
     arm_link_name_pairs: Optional[List[Tuple[str, str]]] = None
     arm_link_quads_2d: Optional[List[List[Tuple[int, int]]]] = None
+    roi_mask: Optional[np.ndarray] = None
+    conflict_mode: Optional[str] = None
+    conflict_reason: str = ""
+    conflict_stats: Optional[dict] = None
 
 
 class UnifiedDefenseInterface:
@@ -1437,4 +1564,8 @@ class UnifiedDefenseInterface:
             arm_link_segments_2d=getattr(dd, "arm_link_segments_2d", None),
             arm_link_name_pairs=getattr(dd, "arm_link_name_pairs", None),
             arm_link_quads_2d=getattr(dd, "arm_link_quads_2d", None),
+            roi_mask=getattr(dd, "roi_mask", None),
+            conflict_mode=getattr(dd, "conflict_mode", None),
+            conflict_reason=str(getattr(dd, "conflict_reason", "")),
+            conflict_stats=getattr(dd, "conflict_stats", None),
         )
