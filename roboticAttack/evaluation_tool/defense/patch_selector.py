@@ -45,6 +45,7 @@ class PatchSelectorConfig:
     tau_arm: float = 0.3              # Overlap threshold with arm_region_grid when provided; same semantics as tau_g
     tau_patch_strength: float = 0.05  # Minimum anomaly mass required to be considered a valid patch
     near_task_tau: float = 0.08       # If all overlap > tau_g, but mass >= near_task_tau, mark as NEAR_TASK_PATCH
+    allow_near_task_patch: bool = False
 
 class PatchSelector:
     def __init__(self, config: PatchSelectorConfig):
@@ -188,6 +189,23 @@ class PatchSelector:
                 best_core,
                 best_guard,
             ) = near_task_candidates[0]
+
+            if not bool(getattr(self.config, "allow_near_task_patch", False)):
+                return PatchSelectResult(
+                    verdict="NO_PATCH",
+                    roi=None,
+                    score=float(best_score),
+                    reason=(
+                        f"Near-task candidate rejected by safe-region policy: "
+                        f"score={best_score:.3f}, "
+                        f"iou_G={best_iou_g:.3f}, "
+                        f"gripper_core={best_gripper_core:.3f}, "
+                        f"gripper_guard={best_gripper_guard:.3f}, "
+                        f"iou_arm={best_iou_arm:.3f}, "
+                        f"arm_core={best_core:.3f}, "
+                        f"arm_guard={best_guard:.3f}"
+                    ),
+                )
 
             if best_score >= self.config.near_task_tau:
                 reason_ious = f"iou_G={best_iou_g:.3f}"

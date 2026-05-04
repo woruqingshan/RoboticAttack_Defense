@@ -490,7 +490,9 @@ def eval_libero(cfg) -> None:
                 ps_cfg = PatchSelectorConfig(
                     tau_g=getattr(cfg, "defense_tau_g", 0.3),
                     tau_arm=getattr(cfg, "defense_tau_arm", 0.3),
-                    tau_patch_strength=getattr(cfg, "defense_tau_patch_strength", 0.05)
+                    tau_patch_strength=getattr(cfg, "defense_tau_patch_strength", 0.05),
+                    near_task_tau=getattr(cfg, "defense_near_task_tau", 0.08),
+                    allow_near_task_patch=getattr(cfg, "defense_allow_near_task_patch", False),
                 )
                 patch_selector = PatchSelector(ps_cfg)
 
@@ -510,8 +512,8 @@ def eval_libero(cfg) -> None:
                     score_quantile=float(getattr(cfg, "defense_pixel_score_quantile", 0.65)),
                     min_area_ratio=float(getattr(cfg, "defense_pixel_min_area_ratio", 0.08)),
                     min_cover_ratio=float(getattr(cfg, "defense_pixel_min_cover_ratio", 0.40)),
-                    keep_largest_component=bool(getattr(cfg, "defense_pixel_keep_largest_component", True)),
-                    hard_forbid_core=bool(getattr(cfg, "defense_pixel_hard_forbid_core", True)),
+                    keep_largest_component=bool(getattr(cfg, "defense_pixel_keep_largest_component", False)),
+                    hard_forbid_core=bool(getattr(cfg, "defense_pixel_hard_forbid_core", False)),
                 )
                 pixel_mask_refiner = PixelMaskRefiner(pm_cfg)
 
@@ -1077,7 +1079,7 @@ def parse_args():
     parser.add_argument("--defense_quality_mass_source", type=str, default="heatmap", choices=["heatmap", "grid"], help="Mass source for quality gate (auto mode).")
 
     # Safety Region Layer
-    parser.add_argument("--defense_safety_region_enabled", type=str2bool, default=True, help="Enable safety region fusion layer.")
+    parser.add_argument("--defense_safety_region_enabled", type=str2bool, default=False, help="Enable safety region fusion layer.")
     parser.add_argument("--defense_safety_w_arm_core", type=float, default=1.0, help="Penalty weight for arm core region.")
     parser.add_argument("--defense_safety_w_arm_guard", type=float, default=0.6, help="Penalty weight for arm guard region.")
     parser.add_argument("--defense_safety_w_gripper_core", type=float, default=1.0, help="Penalty weight for gripper core region.")
@@ -1085,7 +1087,7 @@ def parse_args():
     parser.add_argument("--defense_safety_smooth_kernel", type=int, default=0, help="Optional smoothing kernel size for penalty map (0 disables).")
 
     # Pixel Mask Optimizer Layer
-    parser.add_argument("--defense_pixel_mask_refine_enabled", type=str2bool, default=True, help="Enable pixel-level mask refinement.")
+    parser.add_argument("--defense_pixel_mask_refine_enabled", type=str2bool, default=False, help="Enable pixel-level mask refinement.")
     parser.add_argument("--defense_pixel_lambda_safety", type=float, default=0.75, help="Safety penalty coefficient in pixel score.")
     parser.add_argument("--defense_pixel_score_quantile", type=float, default=0.65, help="Score quantile threshold for mask binarization.")
     parser.add_argument("--defense_pixel_min_area_ratio", type=float, default=0.08, help="Minimum selected pixel ratio in ROI.")
@@ -1094,7 +1096,7 @@ def parse_args():
     parser.add_argument("--defense_pixel_hard_forbid_core", type=str2bool, default=True, help="Disallow selecting core safety pixels during mask refinement.")
 
     # Temporal Conflict Layer
-    parser.add_argument("--defense_temporal_conflict_enabled", type=str2bool, default=True, help="Enable temporal conflict resolver.")
+    parser.add_argument("--defense_temporal_conflict_enabled", type=str2bool, default=False, help="Enable temporal conflict resolver.")
     parser.add_argument("--defense_conflict_core_hard_on", type=float, default=0.10, help="Core-overlap threshold to enter HARD mode.")
     parser.add_argument("--defense_conflict_core_hard_off", type=float, default=0.04, help="Core-overlap threshold to exit HARD mode.")
     parser.add_argument("--defense_conflict_guard_soft_on", type=float, default=0.25, help="Guard-overlap threshold to enter SOFT mode.")
@@ -1119,6 +1121,8 @@ def parse_args():
     parser.add_argument("--defense_tau_g", type=float, default=0.3, help="Overlap threshold with GripperPrior for PatchSelector.")
     parser.add_argument("--defense_tau_arm", type=float, default=0.3, help="Overlap threshold with projected arm masks for PatchSelector.")
     parser.add_argument("--defense_tau_patch_strength", type=float, default=0.05, help="Minimum anomaly mass for PatchSelector.")
+    parser.add_argument("--defense_near_task_tau", type=float, default=0.08, help="Minimum anomaly score for allowing near-task patch when enabled.")
+    parser.add_argument("--defense_allow_near_task_patch", type=str2bool, default=False, help="Whether to allow near-task patch candidates to enter LOCKED.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
     parser.add_argument("--defense_arm_skeleton_enabled", type=str2bool, default=False, help="Enable arm skeleton prior built from simulator link poses.")
@@ -1135,7 +1139,7 @@ def parse_args():
     parser.add_argument("--defense_arm_min_valid_points", type=int, default=3, help="Minimum valid projected keypoints required for the arm skeleton prior.")
 
     # PRAC checker parameters
-    parser.add_argument("--defense_prac_enabled", type=str2bool, default=True, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")
+    parser.add_argument("--defense_prac_enabled", type=str2bool, default=False, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")
     parser.add_argument("--defense_prac_n_views", type=int, default=6, help="Number of random views for consensus attention (PRAC).")
     parser.add_argument("--defense_prac_patch_size", type=int, default=16, help="Patch size for random patch-wise perturbation (PRAC, pixels).")
     parser.add_argument("--defense_prac_mask_ratio", type=float, default=0.25, help="Fraction of patches to perturb (PRAC, 0-1).")
