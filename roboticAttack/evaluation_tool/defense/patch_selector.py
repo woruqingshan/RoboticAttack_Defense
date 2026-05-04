@@ -9,8 +9,9 @@ NO_PATCH. Outputs: NO_PATCH (no purify), PATCH_FOUND (lock best ROI), or
 NEAR_TASK_PATCH (lock but force mask refinement in Step 4).
 """
 
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Any
+import math
 
 from .temporal import GridBox, grid_iou
 
@@ -32,12 +33,100 @@ def _grid_mask_overlap_ratio(roi: GridBox, grid_mask: Optional[object]) -> float
     roi_area = float((x1 - x0) * (y1 - y0))
     return float(mask[y0:y1, x0:x1].sum() / max(roi_area, 1.0))
 
+
+def _roi_grid_dict(
+    roi: Optional[GridBox],
+    *,
+    grid_h: Optional[int] = None,
+    grid_w: Optional[int] = None,
+) -> Optional[Dict[str, int]]:
+    if roi is None:
+        return None
+    out = {
+        "gx0": int(roi.gx0),
+        "gy0": int(roi.gy0),
+        "gx1": int(roi.gx1),
+        "gy1": int(roi.gy1),
+    }
+    if grid_w is not None:
+        out["gw"] = int(grid_w)
+    if grid_h is not None:
+        out["gh"] = int(grid_h)
+    return out
+
+
+def _compute_area_ratio(roi: GridBox, grid_h: int = 16, grid_w: int = 16) -> float:
+    if grid_h <= 0 or grid_w <= 0:
+        return 0.0
+    w = max(0, int(roi.gx1) - int(roi.gx0))
+    h = max(0, int(roi.gy1) - int(roi.gy0))
+    area = float(w * h)
+    denom = float(grid_h * grid_w)
+    if denom <= 0:
+        return 0.0
+    return float(area / denom)
+
+
+def _compute_aspect(roi: GridBox) -> float:
+    w = float(max(0, int(roi.gx1) - int(roi.gx0)))
+    h = float(max(0, int(roi.gy1) - int(roi.gy0)))
+    if w <= 0.0 or h <= 0.0:
+        return 0.0
+    return float(w / max(h, 1e-12))
+
+
+def _compute_size_prior(area_ratio: float, expected: float, sigma: float) -> float:
+    if sigma <= 0.0:
+        return 0.0
+    z = abs(float(area_ratio) - float(expected)) / float(sigma)
+    return float(math.exp(-z))
+
+
+def _compute_square_prior(aspect: float, sigma: float) -> float:
+    if sigma <= 0.0 or aspect <= 0.0:
+        return 0.0
+    z = abs(float(math.log(float(aspect)))) / float(sigma)
+    return float(math.exp(-z))
+
+
+def _compute_corner_prior(
+    roi: GridBox,
+    grid_h: int = 16,
+    grid_w: int = 16,
+    corner_type: str = "top_right",
+    sigma: float = 0.35,
+    enabled: bool = False,
+) -> float:
+    if not enabled or sigma <= 0.0:
+        return 0.0
+    if str(corner_type) == "none":
+        return 0.0
+    if grid_h <= 0 or grid_w <= 0:
+        return 0.0
+    cx = (float(roi.gx0) + float(roi.gx1)) * 0.5
+    cy = (float(roi.gy0) + float(roi.gy1)) * 0.5
+    if corner_type == "top_left":
+        tx, ty = 0.0, 0.0
+    elif corner_type == "bottom_left":
+        tx, ty = 0.0, float(grid_h - 1)
+    elif corner_type == "bottom_right":
+        tx, ty = float(grid_w - 1), float(grid_h - 1)
+    else:
+        tx, ty = float(grid_w - 1), 0.0
+    dx = cx - tx
+    dy = cy - ty
+    norm = float(max(grid_w - 1, grid_h - 1, 1))
+    dist = float(math.sqrt(dx * dx + dy * dy) / norm)
+    z = dist / float(sigma)
+    return float(math.exp(-(z * z)))
+
 @dataclass
 class PatchSelectResult:
     verdict: str           # "NO_PATCH", "PATCH_FOUND", or "NEAR_TASK_PATCH"
     roi: Optional[GridBox]
     score: float           # The anomaly score / mass of the selected ROI
     reason: str
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class PatchSelectorConfig:
@@ -46,6 +135,14 @@ class PatchSelectorConfig:
     tau_patch_strength: float = 0.05  # Minimum anomaly mass required to be considered a valid patch
     near_task_tau: float = 0.08       # If all overlap > tau_g, but mass >= near_task_tau, mark as NEAR_TASK_PATCH
     allow_near_task_patch: bool = False
+    selector_debug_enabled: bool = False
+    selector_debug_topk: int = 3
+    expected_patch_area_ratio: float = 0.04
+    patch_area_sigma: float = 0.03
+    patch_aspect_sigma: float = 0.4
+    corner_prior_enabled: bool = False
+    corner_prior_type: str = "top_right"
+    corner_prior_sigma: float = 0.35
 
 class PatchSelector:
     def __init__(self, config: PatchSelectorConfig):
@@ -79,14 +176,53 @@ class PatchSelector:
         Returns:
             PatchSelectResult indicating the decision.
         """
+        selector_debug = {
+            "enabled": bool(getattr(self.config, "selector_debug_enabled", False)),
+            "topk": [],
+            "selected": None,
+            "selected_bucket": None,
+            "selected_rank_input": None,
+            "selected_raw_score": None,
+            "selected_diagnostic_score": None,
+            "verdict": None,
+            "reason": None,
+        }
+
         if not top_k_candidates:
-            return PatchSelectResult(verdict="NO_PATCH", roi=None, score=0.0, reason="No candidates from localizer")
+            selector_debug["verdict"] = "NO_PATCH"
+            selector_debug["reason"] = "No candidates from localizer"
+            return PatchSelectResult(
+                verdict="NO_PATCH",
+                roi=None,
+                score=0.0,
+                reason="No candidates from localizer",
+                debug=selector_debug,
+            )
 
         filtered_candidates = []
         near_task_candidates = []
+        debug_topk_limit = int(max(0, getattr(self.config, "selector_debug_topk", 3)))
+        debug_enabled = bool(getattr(self.config, "selector_debug_enabled", False))
+        debug_by_roi = {}
+        grid_h = 16
+        grid_w = 16
+        if debug_enabled:
+            for grid_mask in (
+                gripper_core_grid_mask,
+                gripper_guard_grid_mask,
+                arm_core_grid_mask,
+                arm_guard_grid_mask,
+            ):
+                if grid_mask is None or not hasattr(grid_mask, "shape"):
+                    continue
+                shape = getattr(grid_mask, "shape", None)
+                if isinstance(shape, tuple) and len(shape) == 2:
+                    grid_h = int(shape[0])
+                    grid_w = int(shape[1])
+                    break
 
         # 1. Geometric Filtering (G_grid and optionally arm_region_grid)
-        for roi, score in top_k_candidates:
+        for rank_input, (roi, score) in enumerate(top_k_candidates, start=1):
             if roi is None:
                 continue
 
@@ -107,6 +243,62 @@ class PatchSelector:
                 or overlap_arm_core > self.config.tau_arm
                 or overlap_arm_guard > self.config.tau_arm
             )
+
+            if debug_enabled:
+                area_ratio = _compute_area_ratio(roi, grid_h=grid_h, grid_w=grid_w)
+                aspect = _compute_aspect(roi)
+                size_prior = _compute_size_prior(
+                    area_ratio,
+                    getattr(self.config, "expected_patch_area_ratio", 0.04),
+                    getattr(self.config, "patch_area_sigma", 0.03),
+                )
+                square_prior = _compute_square_prior(
+                    aspect,
+                    getattr(self.config, "patch_aspect_sigma", 0.4),
+                )
+                corner_prior = _compute_corner_prior(
+                    roi,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    corner_type=str(getattr(self.config, "corner_prior_type", "top_right")),
+                    sigma=float(getattr(self.config, "corner_prior_sigma", 0.35)),
+                    enabled=bool(getattr(self.config, "corner_prior_enabled", False)),
+                )
+                diagnostic_score = (
+                    float(score)
+                    + 0.35 * float(size_prior)
+                    + 0.25 * float(square_prior)
+                    + 0.30 * float(corner_prior)
+                    - 1.00 * float(overlap_arm_core)
+                    - 0.80 * float(overlap_arm_guard)
+                    - 0.80 * float(overlap_gripper_core)
+                    - 0.50 * float(overlap_gripper_guard)
+                )
+                bucket = "near_task" if (over_g or over_arm) else "filtered"
+                debug_entry = {
+                    "rank_input": int(rank_input),
+                    "roi_grid": _roi_grid_dict(roi, grid_h=grid_h, grid_w=grid_w),
+                    "raw_score": float(score),
+                    "diagnostic_score": float(diagnostic_score),
+                    "area_ratio": float(area_ratio),
+                    "aspect": float(aspect),
+                    "size_prior": float(size_prior),
+                    "square_prior": float(square_prior),
+                    "corner_prior": float(corner_prior),
+                    "iou_g": float(iou_g),
+                    "gripper_core_overlap": float(overlap_gripper_core),
+                    "gripper_guard_overlap": float(overlap_gripper_guard),
+                    "iou_arm": float(iou_arm),
+                    "arm_core_overlap": float(overlap_arm_core),
+                    "arm_guard_overlap": float(overlap_arm_guard),
+                    "over_g": bool(over_g),
+                    "over_arm": bool(over_arm),
+                    "bucket": bucket,
+                }
+                if len(selector_debug["topk"]) < debug_topk_limit:
+                    selector_debug["topk"].append(debug_entry)
+                debug_by_roi[(int(roi.gx0), int(roi.gy0), int(roi.gx1), int(roi.gy1))] = debug_entry
+
             if not over_g and not over_arm:
                 filtered_candidates.append(
                     (
@@ -151,11 +343,16 @@ class PatchSelector:
 
             # Anomaly strength threshold check
             if best_score < self.config.tau_patch_strength:
+                selector_debug["verdict"] = "NO_PATCH"
+                selector_debug["reason"] = (
+                    f"Best isolated candidate score {best_score:.3f} < tau_patch_strength {self.config.tau_patch_strength:.3f}"
+                )
                 return PatchSelectResult(
                     verdict="NO_PATCH",
                     roi=None,
                     score=best_score,
-                    reason=f"Best isolated candidate score {best_score:.3f} < tau_patch_strength {self.config.tau_patch_strength:.3f}"
+                    reason=f"Best isolated candidate score {best_score:.3f} < tau_patch_strength {self.config.tau_patch_strength:.3f}",
+                    debug=selector_debug,
                 )
             reason_ious = f"iou_G={best_iou_g:.3f}"
             if gripper_core_grid_mask is not None:
@@ -168,11 +365,21 @@ class PatchSelector:
                 reason_ious += f" arm_core={best_core:.3f}"
             if arm_guard_grid_mask is not None:
                 reason_ious += f" arm_guard={best_guard:.3f}"
+            selector_debug["selected"] = _roi_grid_dict(best_roi, grid_h=grid_h, grid_w=grid_w)
+            selector_debug["selected_bucket"] = "filtered"
+            selector_debug["selected_raw_score"] = float(best_score)
+            selected_entry = debug_by_roi.get((int(best_roi.gx0), int(best_roi.gy0), int(best_roi.gx1), int(best_roi.gy1)))
+            if selected_entry is not None:
+                selector_debug["selected_rank_input"] = selected_entry.get("rank_input")
+                selector_debug["selected_diagnostic_score"] = selected_entry.get("diagnostic_score")
+            selector_debug["verdict"] = "PATCH_FOUND"
+            selector_debug["reason"] = f"Isolated patch found: score={best_score:.3f}, {reason_ious}"
             return PatchSelectResult(
                 verdict="PATCH_FOUND",
                 roi=best_roi,
                 score=best_score,
-                reason=f"Isolated patch found: score={best_score:.3f}, {reason_ious}"
+                reason=f"Isolated patch found: score={best_score:.3f}, {reason_ious}",
+                debug=selector_debug,
             )
 
         # 3. Near-task exception
@@ -191,6 +398,24 @@ class PatchSelector:
             ) = near_task_candidates[0]
 
             if not bool(getattr(self.config, "allow_near_task_patch", False)):
+                selector_debug["selected"] = _roi_grid_dict(best_roi, grid_h=grid_h, grid_w=grid_w)
+                selector_debug["selected_bucket"] = "near_task_rejected"
+                selector_debug["selected_raw_score"] = float(best_score)
+                selected_entry = debug_by_roi.get((int(best_roi.gx0), int(best_roi.gy0), int(best_roi.gx1), int(best_roi.gy1)))
+                if selected_entry is not None:
+                    selector_debug["selected_rank_input"] = selected_entry.get("rank_input")
+                    selector_debug["selected_diagnostic_score"] = selected_entry.get("diagnostic_score")
+                selector_debug["verdict"] = "NO_PATCH"
+                selector_debug["reason"] = (
+                    f"Near-task candidate rejected by safe-region policy: "
+                    f"score={best_score:.3f}, "
+                    f"iou_G={best_iou_g:.3f}, "
+                    f"gripper_core={best_gripper_core:.3f}, "
+                    f"gripper_guard={best_gripper_guard:.3f}, "
+                    f"iou_arm={best_iou_arm:.3f}, "
+                    f"arm_core={best_core:.3f}, "
+                    f"arm_guard={best_guard:.3f}"
+                )
                 return PatchSelectResult(
                     verdict="NO_PATCH",
                     roi=None,
@@ -205,6 +430,7 @@ class PatchSelector:
                         f"arm_core={best_core:.3f}, "
                         f"arm_guard={best_guard:.3f}"
                     ),
+                    debug=selector_debug,
                 )
 
             if best_score >= self.config.near_task_tau:
@@ -219,17 +445,30 @@ class PatchSelector:
                     reason_ious += f" arm_core={best_core:.3f}"
                 if arm_guard_grid_mask is not None:
                     reason_ious += f" arm_guard={best_guard:.3f}"
+                selector_debug["selected"] = _roi_grid_dict(best_roi, grid_h=grid_h, grid_w=grid_w)
+                selector_debug["selected_bucket"] = "near_task"
+                selector_debug["selected_raw_score"] = float(best_score)
+                selected_entry = debug_by_roi.get((int(best_roi.gx0), int(best_roi.gy0), int(best_roi.gx1), int(best_roi.gy1)))
+                if selected_entry is not None:
+                    selector_debug["selected_rank_input"] = selected_entry.get("rank_input")
+                    selector_debug["selected_diagnostic_score"] = selected_entry.get("diagnostic_score")
+                selector_debug["verdict"] = "NEAR_TASK_PATCH"
+                selector_debug["reason"] = f"Near-task patch detected: score={best_score:.3f} >= {self.config.near_task_tau:.3f}, {reason_ious}"
                 return PatchSelectResult(
                     verdict="NEAR_TASK_PATCH",
                     roi=best_roi,
                     score=best_score,
-                    reason=f"Near-task patch detected: score={best_score:.3f} >= {self.config.near_task_tau:.3f}, {reason_ious}"
+                    reason=f"Near-task patch detected: score={best_score:.3f} >= {self.config.near_task_tau:.3f}, {reason_ious}",
+                    debug=selector_debug,
                 )
 
         # 4. Fallback: all candidates were near the gripper/arm but scores were too low
+        selector_debug["verdict"] = "NO_PATCH"
+        selector_debug["reason"] = "All candidates were near task/arm area and had low anomaly scores"
         return PatchSelectResult(
             verdict="NO_PATCH",
             roi=None,
             score=0.0,
-            reason="All candidates were near task/arm area and had low anomaly scores"
+            reason="All candidates were near task/arm area and had low anomaly scores",
+            debug=selector_debug,
         )

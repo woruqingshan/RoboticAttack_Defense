@@ -90,6 +90,7 @@ def defense_result_to_log_dict(result: Any) -> Dict[str, Any]:
         "conflict_mode",
         "conflict_reason",
         "conflict_stats",
+        "selector_debug",
     ]:
         base.setdefault(k, None)
 
@@ -239,6 +240,61 @@ def format_defense_geometry_lines(step: int, result: Any) -> List[str]:
         lines.append(f"[DEFENSE][GEOM][ARM_LINKS] step={int(step)} segments={link_entries}")
     elif arm_links:
         lines.append(f"[DEFENSE][GEOM][ARM_LINKS] step={int(step)} links={arm_links}")
+
+    return lines
+
+
+def format_defense_selector_lines(step: int, result: Any) -> List[str]:
+    """Format selector debug lines for terminal output."""
+    d = defense_result_to_log_dict(result)
+    selector_debug = d.get("selector_debug")
+    if not isinstance(selector_debug, dict):
+        return []
+    if not bool(selector_debug.get("enabled", False)):
+        return []
+
+    def _fmt(val: Any) -> str:
+        if val is None:
+            return "None"
+        if isinstance(val, float):
+            return f"{val:.4f}"
+        return str(val)
+
+    lines: List[str] = []
+    summary = (
+        f"[DEFENSE][SELECTOR_SUMMARY] step={int(step)} "
+        f"verdict={_fmt(selector_debug.get('verdict'))} "
+        f"selected={_fmt(selector_debug.get('selected'))} "
+        f"selected_bucket={_fmt(selector_debug.get('selected_bucket'))} "
+        f"selected_raw_score={_fmt(selector_debug.get('selected_raw_score'))} "
+        f"selected_diagnostic_score={_fmt(selector_debug.get('selected_diagnostic_score'))} "
+        f"reason={_fmt(selector_debug.get('reason'))}"
+    )
+    lines.append(summary)
+
+    for entry in selector_debug.get("topk", []) or []:
+        line = (
+            f"[DEFENSE][SELECTOR_TOPK] step={int(step)} "
+            f"rank_input={_fmt(entry.get('rank_input'))} "
+            f"bucket={_fmt(entry.get('bucket'))} "
+            f"roi_grid={_fmt(entry.get('roi_grid'))} "
+            f"raw_score={_fmt(entry.get('raw_score'))} "
+            f"diagnostic_score={_fmt(entry.get('diagnostic_score'))} "
+            f"area_ratio={_fmt(entry.get('area_ratio'))} "
+            f"aspect={_fmt(entry.get('aspect'))} "
+            f"size_prior={_fmt(entry.get('size_prior'))} "
+            f"square_prior={_fmt(entry.get('square_prior'))} "
+            f"corner_prior={_fmt(entry.get('corner_prior'))} "
+            f"iou_g={_fmt(entry.get('iou_g'))} "
+            f"gripper_core_overlap={_fmt(entry.get('gripper_core_overlap'))} "
+            f"gripper_guard_overlap={_fmt(entry.get('gripper_guard_overlap'))} "
+            f"iou_arm={_fmt(entry.get('iou_arm'))} "
+            f"arm_core_overlap={_fmt(entry.get('arm_core_overlap'))} "
+            f"arm_guard_overlap={_fmt(entry.get('arm_guard_overlap'))} "
+            f"over_g={_fmt(entry.get('over_g'))} "
+            f"over_arm={_fmt(entry.get('over_arm'))}"
+        )
+        lines.append(line)
 
     return lines
 

@@ -106,6 +106,7 @@ from evaluation_tool.defense import (
     NoOpVerifier,
     format_defense_log_line,
     format_defense_geometry_lines,
+    format_defense_selector_lines,
     defense_result_to_log_dict,
     # Multimodal geometry prior components
     GripperPrior,
@@ -493,6 +494,14 @@ def eval_libero(cfg) -> None:
                     tau_patch_strength=getattr(cfg, "defense_tau_patch_strength", 0.05),
                     near_task_tau=getattr(cfg, "defense_near_task_tau", 0.08),
                     allow_near_task_patch=getattr(cfg, "defense_allow_near_task_patch", False),
+                    selector_debug_enabled=getattr(cfg, "defense_selector_debug_enabled", False),
+                    selector_debug_topk=int(getattr(cfg, "defense_selector_debug_topk", 3)),
+                    expected_patch_area_ratio=float(getattr(cfg, "defense_expected_patch_area_ratio", 0.04)),
+                    patch_area_sigma=float(getattr(cfg, "defense_patch_area_sigma", 0.03)),
+                    patch_aspect_sigma=float(getattr(cfg, "defense_patch_aspect_sigma", 0.4)),
+                    corner_prior_enabled=bool(getattr(cfg, "defense_corner_prior_enabled", False)),
+                    corner_prior_type=str(getattr(cfg, "defense_corner_prior_type", "top_right")),
+                    corner_prior_sigma=float(getattr(cfg, "defense_corner_prior_sigma", 0.35)),
                 )
                 patch_selector = PatchSelector(ps_cfg)
 
@@ -790,6 +799,9 @@ def eval_libero(cfg) -> None:
                         if _defense_debug_geometry(cfg):
                             for geom_line in format_defense_geometry_lines(step=int(t), result=defense_result):
                                 _defense_debug_print(cfg, geom_line, log_file=log_file)
+                        if getattr(cfg, "defense_debug_selector", False):
+                            for selector_line in format_defense_selector_lines(step=int(t), result=defense_result):
+                                _defense_debug_print(cfg, selector_line, log_file=log_file)
                         
                         # Check if purification is needed (unified field)
                         roi_mask = getattr(defense_result, "roi_mask", None)
@@ -1056,6 +1068,7 @@ def parse_args():
     parser.add_argument("--defense_debug", type=str2bool, default=False, help="Print defense debug logs to terminal and log file.")
     parser.add_argument("--defense_debug_every_step", type=str2bool, default=False, help="When enabled, print defense scores for every step (debug only).")
     parser.add_argument("--defense_debug_geometry", type=str2bool, default=False, help="When enabled, print projected gripper / arm geometry coordinates to the terminal (debug only).")
+    parser.add_argument("--defense_debug_selector", type=str2bool, default=False, help="When enabled, print selector debug lines to the terminal (debug only).")
     parser.add_argument("--defense_viz", type=str2bool, default=False, help="If enabled, save side-by-side frames (policy input | heatmap overlay).")
     parser.add_argument("--defense_viz_alpha", type=float, default=0.45, help="Overlay alpha for heatmap visualization (0-1).")
     parser.add_argument("--defense_geometry_rotate_180", type=str2bool, default=True, help="Whether the policy image applies a 180-degree rotation to the raw camera frame. Projected geometry derives its own row / col alignment from this setting.")
@@ -1123,6 +1136,20 @@ def parse_args():
     parser.add_argument("--defense_tau_patch_strength", type=float, default=0.05, help="Minimum anomaly mass for PatchSelector.")
     parser.add_argument("--defense_near_task_tau", type=float, default=0.08, help="Minimum anomaly score for allowing near-task patch when enabled.")
     parser.add_argument("--defense_allow_near_task_patch", type=str2bool, default=False, help="Whether to allow near-task patch candidates to enter LOCKED.")
+    parser.add_argument("--defense_selector_debug_enabled", type=str2bool, default=False, help="Enable selector debug metadata in defense results.")
+    parser.add_argument("--defense_selector_debug_topk", type=int, default=3, help="Max number of selector candidates to log.")
+    parser.add_argument("--defense_expected_patch_area_ratio", type=float, default=0.04, help="Expected patch area ratio for diagnostic scoring.")
+    parser.add_argument("--defense_patch_area_sigma", type=float, default=0.03, help="Area sigma for diagnostic size prior.")
+    parser.add_argument("--defense_patch_aspect_sigma", type=float, default=0.4, help="Aspect sigma for diagnostic square prior.")
+    parser.add_argument("--defense_corner_prior_enabled", type=str2bool, default=False, help="Enable diagnostic corner prior for selector logging.")
+    parser.add_argument(
+        "--defense_corner_prior_type",
+        type=str,
+        default="top_right",
+        choices=["top_right", "top_left", "bottom_right", "bottom_left", "none"],
+        help="Corner prior type (top_right|top_left|bottom_right|bottom_left|none).",
+    )
+    parser.add_argument("--defense_corner_prior_sigma", type=float, default=0.35, help="Corner prior sigma for diagnostic scoring.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
     parser.add_argument("--defense_arm_skeleton_enabled", type=str2bool, default=False, help="Enable arm skeleton prior built from simulator link poses.")

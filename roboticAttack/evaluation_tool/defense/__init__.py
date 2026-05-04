@@ -32,6 +32,7 @@ from .logging_utils import (
     defense_result_to_log_dict,
     format_defense_log_line,
     format_defense_geometry_lines,
+    format_defense_selector_lines,
 )
 
 from .gripper_prior import GripperPrior, GripperPriorConfig, GripperPriorResult, GripperSegment2D
@@ -79,6 +80,7 @@ __all__ = [
     "defense_result_to_log_dict",
     "format_defense_log_line",
     "format_defense_geometry_lines",
+    "format_defense_selector_lines",
     # Multimodal geometry prior components
     "GripperPrior",
     "GripperPriorConfig",
