@@ -49,6 +49,23 @@ from .pixel_mask_refiner import PixelMaskRefinerConfig, PixelMaskRefineResult, P
 from .temporal_conflict import TemporalConflictConfig, TemporalConflictDecision, TemporalConflictResolver
 from .mask_postprocess import erode_mask, dilate_mask, mask_to_tight_box
 from .mask_metrics import mask_to_box, overlap_ratio, summarize_mask
+from .recovery_metrics import (
+    action_metrics,
+    attention_metrics,
+    binary_mask_metrics,
+    mask_overlap_ratio,
+    safe_float_dict,
+    safe_json_value,
+)
+from .patch_mask_utils import (
+    build_axis_aligned_patch_mask,
+    box_to_mask,
+    infer_patch_hw,
+    mask_to_box_xyxy,
+    patch_box_xyxy,
+    roi_to_mask,
+)
+from .metrics_logger import JsonlMetricsLogger
 
 __all__ = [
     # Sensor
@@ -109,4 +126,17 @@ __all__ = [
     "mask_to_box",
     "overlap_ratio",
     "summarize_mask",
+    "action_metrics",
+    "attention_metrics",
+    "binary_mask_metrics",
+    "mask_overlap_ratio",
+    "safe_float_dict",
+    "safe_json_value",
+    "build_axis_aligned_patch_mask",
+    "box_to_mask",
+    "infer_patch_hw",
+    "mask_to_box_xyxy",
+    "patch_box_xyxy",
+    "roi_to_mask",
+    "JsonlMetricsLogger",
 ]

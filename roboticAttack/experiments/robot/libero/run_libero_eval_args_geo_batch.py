@@ -22,7 +22,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 # CRITICAL: Set CUDA_VISIBLE_DEVICES BEFORE importing torch or any CUDA-using modules
 # Parse --cudaid from command line arguments early to set environment variable
@@ -122,6 +122,17 @@ from evaluation_tool.defense import (
     PixelMaskRefiner,
     TemporalConflictConfig,
     TemporalConflictResolver,
+    JsonlMetricsLogger,
+    action_metrics,
+    attention_metrics,
+    binary_mask_metrics,
+    build_axis_aligned_patch_mask,
+    box_to_mask,
+    infer_patch_hw,
+    mask_overlap_ratio,
+    patch_box_xyxy,
+    roi_to_mask,
+    safe_float_dict,
 )
 
 # PRAC checker (optional import)
@@ -265,6 +276,281 @@ def _maybe_pack_replay_frame(
         return img_to_pack
 
 
+def _metrics_enabled(cfg) -> bool:
+    return bool(getattr(cfg, "metrics_enabled", False))
+
+
+def _metrics_should_sample(cfg, step: int) -> bool:
+    if not _metrics_enabled(cfg):
+        return False
+    if bool(getattr(cfg, "metrics_every_step", True)):
+        return True
+    n = int(max(1, getattr(cfg, "metrics_sample_every_n", 1)))
+    return (int(step) % n) == 0
+
+
+def _copy_heatmap_from_hook(defense_hook) -> Optional[np.ndarray]:
+    if defense_hook is None:
+        return None
+    try:
+        hm = defense_hook.get_heatmap()
+        return np.asarray(hm, dtype=np.float32).copy()
+    except Exception:
+        return None
+
+
+def _copy_action_for_metrics(action) -> Optional[np.ndarray]:
+    if action is None:
+        return None
+    try:
+        return np.asarray(action, dtype=np.float32).copy()
+    except Exception:
+        return None
+
+
+def _box_dict_to_list(box: Any) -> Optional[List[int]]:
+    if box is None:
+        return None
+    if isinstance(box, dict):
+        try:
+            return [int(box["x0"]), int(box["y0"]), int(box["x1"]), int(box["y1"])]
+        except Exception:
+            return None
+    if isinstance(box, (tuple, list)) and len(box) == 4:
+        return [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
+    try:
+        return [int(box.x0), int(box.y0), int(box.x1), int(box.y1)]
+    except Exception:
+        return None
+
+
+def _prefix_metric_keys(metrics: Dict[str, Any], suffix: str) -> Dict[str, Any]:
+    """Rename unprefixed attention metric keys into compact adv/def/clean fields."""
+    mapping = {
+        "pam": f"pam_{suffix}",
+        "topk_attn_iou_patch": f"topk_attn_iou_patch_{suffix}",
+        "attn_center_x": f"attn_center_x_{suffix}",
+        "attn_center_y": f"attn_center_y_{suffix}",
+        "attn_center_dist_patch": f"attn_center_dist_patch_{suffix}",
+    }
+    return {mapping.get(k, f"{k}_{suffix}"): v for k, v in metrics.items()}
+
+
+def _mean_numeric(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
+    vals = []
+    for row in rows:
+        val = row.get(key)
+        if isinstance(val, (int, float, np.integer, np.floating)) and np.isfinite(float(val)):
+            vals.append(float(val))
+    if not vals:
+        return None
+    return float(np.mean(vals))
+
+
+def _build_patch_mask_for_metrics(cfg, patch, image_hw):
+    patch_h = int(getattr(cfg, "metrics_patch_h", 50))
+    patch_w = int(getattr(cfg, "metrics_patch_w", 50))
+    patch_size_source = "cli"
+    if patch is not None:
+        try:
+            patch_h, patch_w = infer_patch_hw(patch)
+            patch_size_source = "patch_tensor"
+        except Exception:
+            patch_size_source = "cli_fallback"
+
+    h, w = int(image_hw[0]), int(image_hw[1])
+    patch_box = patch_box_xyxy(
+        int(cfg.x),
+        int(cfg.y),
+        patch_w=patch_w,
+        patch_h=patch_h,
+        image_w=w,
+        image_h=h,
+    )
+    patch_mask = build_axis_aligned_patch_mask(
+        image_hw=(h, w),
+        x=int(cfg.x),
+        y=int(cfg.y),
+        patch_w=patch_w,
+        patch_h=patch_h,
+    )
+    transformed = (
+        abs(float(getattr(cfg, "angle", 0.0))) > 1e-8
+        or abs(float(getattr(cfg, "shx", 0.0))) > 1e-8
+        or abs(float(getattr(cfg, "shy", 0.0))) > 1e-8
+    )
+    patch_mask_mode = "bbox_fallback" if transformed else "axis_aligned"
+    return patch_mask, patch_box, patch_w, patch_h, patch_size_source, patch_mask_mode
+
+
+def _defense_mask_for_metrics(image_hw, defense_result, dlog: Dict[str, Any]):
+    roi_mask = getattr(defense_result, "roi_mask", None) if defense_result is not None else None
+    if isinstance(roi_mask, np.ndarray) and roi_mask.ndim == 2 and roi_mask.shape == tuple(image_hw):
+        return roi_mask.astype(bool), "pixel_mask"
+    roi_box = dlog.get("roi_box") if isinstance(dlog, dict) else None
+    if roi_box is not None:
+        return roi_to_mask(image_hw, roi_box), "roi_fallback"
+    return None, None
+
+
+def _compute_frame_metrics_row(
+    *,
+    cfg,
+    task_id: int,
+    task_description: str,
+    episode_idx: int,
+    global_episode_id: int,
+    step: int,
+    obs: Dict[str, Any],
+    patch_mask: np.ndarray,
+    patch_box: tuple,
+    patch_w: int,
+    patch_h: int,
+    patch_size_source: str,
+    patch_mask_mode: str,
+    defense_result,
+    dlog: Dict[str, Any],
+    action_clean,
+    action_adv,
+    action_def,
+    hm_clean,
+    hm_adv,
+    hm_def,
+) -> Dict[str, Any]:
+    image_hw = tuple(patch_mask.shape)
+    roi_box_list = _box_dict_to_list(dlog.get("roi_box")) if isinstance(dlog, dict) else None
+    defense_mask, mask_source = _defense_mask_for_metrics(image_hw, defense_result, dlog)
+
+    row: Dict[str, Any] = {
+        "record_type": "frame_metrics",
+        "metrics_version": 1,
+        "task_suite_name": str(getattr(cfg, "task_suite_name", "")),
+        "run_id_note": getattr(cfg, "run_id_note", None),
+        "task_id": int(task_id),
+        "task_description": str(task_description),
+        "episode": int(episode_idx + 1),
+        "episode_id": int(global_episode_id),
+        "step": int(step),
+        "use_patch": bool(getattr(cfg, "use_patch", False)),
+        "defense_enabled": bool(getattr(cfg, "defense_enabled", False)),
+        "patch_x": int(cfg.x),
+        "patch_y": int(cfg.y),
+        "patch_w": int(patch_w),
+        "patch_h": int(patch_h),
+        "patch_size_source": str(patch_size_source),
+        "patch_mask_mode": str(patch_mask_mode),
+        "patch_box": [int(v) for v in patch_box],
+        "patch_x0": int(patch_box[0]),
+        "patch_y0": int(patch_box[1]),
+        "patch_x1": int(patch_box[2]),
+        "patch_y1": int(patch_box[3]),
+        "phase": dlog.get("phase") if isinstance(dlog, dict) else None,
+        "defense_phase": dlog.get("phase") if isinstance(dlog, dict) else None,
+        "defense_reason": dlog.get("reason") if isinstance(dlog, dict) else None,
+        "should_purify": bool(dlog.get("should_purify")) if isinstance(dlog, dict) else False,
+        "masked": bool(dlog.get("should_purify") and dlog.get("roi_box") is not None) if isinstance(dlog, dict) else False,
+        "roi_box": roi_box_list,
+        "mask_source": mask_source,
+        "mass_heatmap": dlog.get("mass_heatmap") if isinstance(dlog, dict) else None,
+        "conflict_mode": dlog.get("conflict_mode") if isinstance(dlog, dict) else None,
+        "patch_verdict": dlog.get("patch_verdict") if isinstance(dlog, dict) else None,
+        "quality_ok": dlog.get("quality_ok") if isinstance(dlog, dict) else None,
+    }
+
+    try:
+        eef = np.asarray(obs.get("robot0_eef_pos", []), dtype=np.float32).reshape(-1)
+        if eef.size >= 3:
+            row.update({"eef_x": float(eef[0]), "eef_y": float(eef[1]), "eef_z": float(eef[2])})
+    except Exception:
+        pass
+
+    if bool(getattr(cfg, "metrics_mask_recovery", True)) and defense_mask is not None:
+        row.update(binary_mask_metrics(defense_mask, patch_mask, prefix="mask"))
+        if roi_box_list is not None:
+            roi_mask = roi_to_mask(image_hw, roi_box_list)
+            row.update(binary_mask_metrics(roi_mask, patch_mask, prefix="selected_roi"))
+        # Approximate robot/gripper overlap from logged geometry boxes when raw safety masks are unavailable.
+        arm_core_box = dlog.get("arm_core_box") if isinstance(dlog, dict) else None
+        arm_guard_box = dlog.get("arm_guard_box") if isinstance(dlog, dict) else None
+        gripper_box = dlog.get("gripper_box") if isinstance(dlog, dict) else None
+        if arm_core_box is not None:
+            row.update(mask_overlap_ratio(defense_mask, box_to_mask(image_hw, arm_core_box), "mask_robot_core"))
+        if arm_guard_box is not None:
+            row.update(mask_overlap_ratio(defense_mask, box_to_mask(image_hw, arm_guard_box), "mask_robot_guard"))
+        if gripper_box is not None:
+            row.update(mask_overlap_ratio(defense_mask, box_to_mask(image_hw, gripper_box), "mask_gripper"))
+
+    if bool(getattr(cfg, "metrics_attention_recovery", False)):
+        top_q = float(getattr(cfg, "metrics_top_quantile", 0.90))
+        row.update(_prefix_metric_keys(attention_metrics(hm_adv, patch_mask, top_quantile=top_q), "adv"))
+        row.update(_prefix_metric_keys(attention_metrics(hm_def, patch_mask, top_quantile=top_q), "def"))
+        row.update(_prefix_metric_keys(attention_metrics(hm_clean, patch_mask, top_quantile=top_q), "clean"))
+        if row.get("pam_adv") is not None and row.get("pam_def") is not None:
+            row["pam_reduction"] = float(row["pam_adv"] - row["pam_def"])
+
+    if bool(getattr(cfg, "metrics_action_recovery", False)):
+        row.update(action_metrics(action_clean, action_adv, action_def))
+
+    return safe_float_dict(row)
+
+
+def _episode_summary_from_rows(
+    *,
+    cfg,
+    task_id: int,
+    task_description: str,
+    episode_idx: int,
+    global_episode_id: int,
+    success: bool,
+    masked_frames: int,
+    acquire_count: int,
+    reacquire_count: int,
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    first_masked = next((r for r in rows if bool(r.get("masked"))), None)
+    summary: Dict[str, Any] = {
+        "record_type": "episode_summary",
+        "metrics_version": 1,
+        "task_suite_name": str(getattr(cfg, "task_suite_name", "")),
+        "run_id_note": getattr(cfg, "run_id_note", None),
+        "task_id": int(task_id),
+        "task_description": str(task_description),
+        "episode": int(episode_idx + 1),
+        "episode_id": int(global_episode_id),
+        "success": bool(success),
+        "masked_frames": int(masked_frames),
+        "acquire_count": int(acquire_count),
+        "reacquire_count": int(reacquire_count),
+        "first_lock_step": first_masked.get("step") if first_masked else None,
+        "first_roi_box": first_masked.get("roi_box") if first_masked else None,
+    }
+    for key in [
+        "mask_patch_iou",
+        "mask_patch_recall",
+        "mask_patch_precision",
+        "mask_area_ratio",
+        "selected_roi_patch_iou",
+        "selected_roi_patch_recall",
+        "selected_roi_patch_precision",
+        "pam_adv",
+        "pam_def",
+        "pam_clean",
+        "pam_reduction",
+        "topk_attn_iou_patch_adv",
+        "topk_attn_iou_patch_def",
+        "attn_center_dist_patch_adv",
+        "attn_center_dist_patch_def",
+        "action_l2_adv_to_clean",
+        "action_l2_def_to_clean",
+        "action_l2_xyz_adv_to_clean",
+        "action_l2_xyz_def_to_clean",
+        "nar_l2",
+        "nar_xyz",
+    ]:
+        summary[f"mean_{key}"] = _mean_numeric(rows, key)
+    return safe_float_dict(summary)
+
+
 # @dataclass
 # class GenerateConfig:
 #     # fmt: off
@@ -356,15 +642,21 @@ def eval_libero(cfg) -> None:
 
     defense_interface = None  # Unified defense interface
     defense_purifier = None  # Keep for direct access if needed
-    if getattr(cfg, "defense_enabled", False):
-        # Create hook (required for both modes)
+    defense_hook = None
+    defense_mode = getattr(cfg, "defense_mode", "known")  # Default: backward compatible
+    metrics_need_attention = bool(
+        getattr(cfg, "metrics_enabled", False) and getattr(cfg, "metrics_attention_recovery", False)
+    )
+    if getattr(cfg, "defense_enabled", False) or metrics_need_attention:
+        # Create hook for defense and/or attention evidence logging.
         defense_hook = OnlineAttentionHook(
             model=model,
             attn_module_name=getattr(cfg, "defense_attn_module", None),
             aggregate_mode=getattr(cfg, "defense_aggregate_mode", "mean"),
             image_size=get_image_resize_size(cfg),
         )
-        
+
+    if getattr(cfg, "defense_enabled", False):
         # Create purifier (required for both modes)
         defense_purifier = ImagePurifier(
             strategy=getattr(cfg, "defense_purifier_strategy", "mask_mean"),
@@ -372,10 +664,8 @@ def eval_libero(cfg) -> None:
             gray_value=getattr(cfg, "defense_gray_value", 127),
             alpha=getattr(cfg, "defense_purifier_alpha", 0.8),
         )
-        
+
         # Create unified interface based on mode
-        defense_mode = getattr(cfg, "defense_mode", "known")  # Default: backward compatible
-        
         if defense_mode == "known":
             # Known location mode: always masks the patch at the given location (no detection needed)
             defense_interface = UnifiedDefenseInterface(
@@ -626,6 +916,18 @@ def eval_libero(cfg) -> None:
             log_file=log_file,
         )
 
+        metrics_logger = None
+        if _metrics_enabled(cfg) and bool(getattr(cfg, "metrics_save_jsonl", True)):
+            note = str(getattr(cfg, "run_id_note", "run") or "run").replace(os.sep, "_")
+            metrics_path = os.path.join(cfg.local_log_dir, f"metrics_task{task_id}_{note}.jsonl")
+            metrics_logger = JsonlMetricsLogger(
+                metrics_path,
+                enabled=True,
+                strict=bool(getattr(cfg, "metrics_strict", False)),
+            )
+            log_file.write(f"[METRICS] Writing recovery metrics to {metrics_path}\n")
+            log_file.flush()
+
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
@@ -669,6 +971,8 @@ def eval_libero(cfg) -> None:
             episode_acquire_count = 0
             episode_reacquire_count = 0
             prev_phase = None
+            done = False
+            episode_metric_rows: List[Dict[str, Any]] = []
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -678,15 +982,22 @@ def eval_libero(cfg) -> None:
                         t += 1
                         continue
 
-                    # Get preprocessed image
+                    # Get preprocessed image. Metrics keep clean / adversarial / defended
+                    # copies as evidence only; the executed action path below is unchanged.
                     policy_image_rotate_180 = bool(getattr(cfg, "defense_geometry_rotate_180", True))
-                    img = get_libero_image(obs, resize_size, rotate_180=policy_image_rotate_180) # Preprocess image for model
+                    img_clean_for_metric = get_libero_image(obs, resize_size, rotate_180=policy_image_rotate_180)
+                    img = img_clean_for_metric.copy() # Preprocess image for model
                     if cfg.use_patch:
                         img = randomPatchTransform.simulation_random_patch(
                             img, patch, geometry=True, colorjitter=False,
                             angle=cfg.angle, shx=cfg.shx, shy=cfg.shy, position=(cfg.x, cfg.y)
                         )
+                    img_adv_for_metric = img.copy()
+                    img_def_for_metric = img_adv_for_metric
                     img_for_policy = img
+                    patch_mask_for_metric, patch_box_for_metric, patch_w_for_metric, patch_h_for_metric, patch_size_source, patch_mask_mode = (
+                        _build_patch_mask_for_metrics(cfg, patch, img_clean_for_metric.shape[:2])
+                    )
 
                     # Prepare observations dict
                     # Note: OpenVLA does not take proprio state as input
@@ -698,9 +1009,9 @@ def eval_libero(cfg) -> None:
                     }
 
                     # Query model to get action (this forward pass is also used to populate attention hooks)
-                    if defense_interface is not None:
+                    if defense_hook is not None:
                         try:
-                            defense_interface.clear()
+                            defense_hook.clear()
                         except Exception as clear_error:
                             error_msg = f"FATAL DEFENSE CLEAR ERROR: {clear_error}"
                             print(error_msg)
@@ -709,6 +1020,19 @@ def eval_libero(cfg) -> None:
                             log_file.close()
                             sys.exit(1)
                     action = get_action(cfg, model, observation, task_description, processor=processor)
+                    action_adv_raw_for_metric = _copy_action_for_metrics(action)
+                    action_def_raw_for_metric = action_adv_raw_for_metric
+                    action_clean_raw_for_metric = None
+                    hm_adv_for_metric = _copy_heatmap_from_hook(defense_hook)
+                    hm_def_for_metric = hm_adv_for_metric
+                    hm_clean_for_metric = None
+                    defense_result = None
+                    dlog: Dict[str, Any] = {
+                        "phase": None,
+                        "reason": None,
+                        "should_purify": False,
+                        "roi_box": None,
+                    }
 
                     # Unified defense step (works for both known and auto modes)
                     heatmap_for_viz = None
@@ -824,15 +1148,67 @@ def eval_libero(cfg) -> None:
                             
                             # Recompute action on purified image
                             observation["full_image"] = img_for_policy
+                            img_def_for_metric = img_for_policy.copy()
                             if getattr(cfg, "defense_recompute_action", True):
-                                defense_interface.clear()
+                                if defense_hook is not None:
+                                    defense_hook.clear()
                                 action = get_action(cfg, model, observation, task_description, processor=processor)
+                                action_def_raw_for_metric = _copy_action_for_metrics(action)
+                                hm_def_for_metric = _copy_heatmap_from_hook(defense_hook)
                             
                             _defense_debug_print(
                                 cfg,
                                 f"[DEFENSE][MASK] {format_defense_log_line(step=int(t), result=defense_result)}",
                                 log_file=log_file,
                             )
+
+                    if _metrics_enabled(cfg) and bool(getattr(cfg, "metrics_action_recovery", False)):
+                        clean_observation = {
+                            "full_image": img_clean_for_metric,
+                            "state": observation["state"],
+                        }
+                        if defense_hook is not None:
+                            try:
+                                defense_hook.clear()
+                            except Exception:
+                                pass
+                        clean_action_tmp = get_action(
+                            cfg,
+                            model,
+                            clean_observation,
+                            task_description,
+                            processor=processor,
+                        )
+                        action_clean_raw_for_metric = _copy_action_for_metrics(clean_action_tmp)
+                        hm_clean_for_metric = _copy_heatmap_from_hook(defense_hook)
+
+                    if _metrics_should_sample(cfg, int(t)):
+                        frame_row = _compute_frame_metrics_row(
+                            cfg=cfg,
+                            task_id=int(task_id),
+                            task_description=task_description,
+                            episode_idx=int(episode_idx),
+                            global_episode_id=int(total_episodes + 1),
+                            step=int(t),
+                            obs=obs,
+                            patch_mask=patch_mask_for_metric,
+                            patch_box=patch_box_for_metric,
+                            patch_w=patch_w_for_metric,
+                            patch_h=patch_h_for_metric,
+                            patch_size_source=patch_size_source,
+                            patch_mask_mode=patch_mask_mode,
+                            defense_result=defense_result,
+                            dlog=dlog,
+                            action_clean=action_clean_raw_for_metric,
+                            action_adv=action_adv_raw_for_metric,
+                            action_def=action_def_raw_for_metric,
+                            hm_clean=hm_clean_for_metric,
+                            hm_adv=hm_adv_for_metric,
+                            hm_def=hm_def_for_metric,
+                        )
+                        episode_metric_rows.append(frame_row)
+                        if metrics_logger is not None:
+                            metrics_logger.write(frame_row)
 
                     # Save replay frame:
                     # - default: policy input image
@@ -896,6 +1272,21 @@ def eval_libero(cfg) -> None:
                 f"masked_frames={episode_masked_frames} acquire_count={episode_acquire_count} reacquire_count={episode_reacquire_count}",
                 log_file=log_file,
             )
+            if _metrics_enabled(cfg):
+                episode_summary_row = _episode_summary_from_rows(
+                    cfg=cfg,
+                    task_id=int(task_id),
+                    task_description=task_description,
+                    episode_idx=int(episode_idx),
+                    global_episode_id=int(total_episodes),
+                    success=bool(done),
+                    masked_frames=int(episode_masked_frames),
+                    acquire_count=int(episode_acquire_count),
+                    reacquire_count=int(episode_reacquire_count),
+                    rows=episode_metric_rows,
+                )
+                if metrics_logger is not None:
+                    metrics_logger.write(episode_summary_row)
 
             # Log current results
             print(f"Success: {done}")
@@ -919,6 +1310,8 @@ def eval_libero(cfg) -> None:
             f"masked_frames={task_masked_frames} acquire_count={task_acquire_count} reacquire_count={task_reacquire_count}",
             log_file=log_file,
         )
+        if metrics_logger is not None:
+            metrics_logger.close()
         if cfg.use_wandb:
             wandb.log(
                 {
@@ -1164,6 +1557,20 @@ def parse_args():
     parser.add_argument("--defense_arm_link_core_thicknesses", type=str, default="", help="Optional comma-separated per-link ArmCore thickness overrides.")
     parser.add_argument("--defense_arm_link_guard_scales", type=str, default="", help="Optional comma-separated per-link guard-scale overrides.")
     parser.add_argument("--defense_arm_min_valid_points", type=int, default=3, help="Minimum valid projected keypoints required for the arm skeleton prior.")
+
+    # Recovery metrics / mechanism evidence logging. These flags only add
+    # instrumentation; they do not alter the executed defense action.
+    parser.add_argument("--metrics_enabled", type=str2bool, default=False, help="Enable recovery metrics JSONL instrumentation.")
+    parser.add_argument("--metrics_action_recovery", type=str2bool, default=False, help="Run an extra clean-image forward and compute action recovery metrics.")
+    parser.add_argument("--metrics_attention_recovery", type=str2bool, default=False, help="Record attention hijacking/suppression metrics when heatmaps are available.")
+    parser.add_argument("--metrics_mask_recovery", type=str2bool, default=True, help="Record mask-vs-patch localization metrics.")
+    parser.add_argument("--metrics_every_step", type=str2bool, default=True, help="Write frame metrics on every rollout step.")
+    parser.add_argument("--metrics_sample_every_n", type=int, default=1, help="When metrics_every_step=False, write one frame row every N steps.")
+    parser.add_argument("--metrics_save_jsonl", type=str2bool, default=True, help="Write recovery metrics to JSONL under local_log_dir.")
+    parser.add_argument("--metrics_strict", type=str2bool, default=False, help="Raise JSONL logging errors instead of dropping bad metric rows.")
+    parser.add_argument("--metrics_patch_w", type=int, default=50, help="Fallback patch width for ground-truth patch mask.")
+    parser.add_argument("--metrics_patch_h", type=int, default=50, help="Fallback patch height for ground-truth patch mask.")
+    parser.add_argument("--metrics_top_quantile", type=float, default=0.90, help="Attention quantile for Top-K attention IoU with patch.")
 
     # PRAC checker parameters
     parser.add_argument("--defense_prac_enabled", type=str2bool, default=False, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")
