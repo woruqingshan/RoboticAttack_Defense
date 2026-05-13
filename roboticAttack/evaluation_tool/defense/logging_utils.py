@@ -264,9 +264,22 @@ def format_defense_selector_lines(step: int, result: Any) -> List[str]:
     summary = (
         f"[DEFENSE][SELECTOR_SUMMARY] step={int(step)} "
         f"verdict={_fmt(selector_debug.get('verdict'))} "
+        f"use_final_score={_fmt(selector_debug.get('use_final_score'))} "
+        f"final_env_prior_enabled={_fmt(selector_debug.get('final_env_prior_enabled'))} "
+        f"final_robot_prior_enabled={_fmt(selector_debug.get('final_robot_prior_enabled'))} "
         f"selected={_fmt(selector_debug.get('selected'))} "
         f"selected_bucket={_fmt(selector_debug.get('selected_bucket'))} "
         f"selected_raw_score={_fmt(selector_debug.get('selected_raw_score'))} "
+        f"selected_final_score={_fmt(selector_debug.get('selected_final_score'))} "
+        f"selected_evidence_score={_fmt(selector_debug.get('selected_evidence_score'))} "
+        f"selected_env_prior_score={_fmt(selector_debug.get('selected_env_prior_score'))} "
+        f"selected_center_dist={_fmt(selector_debug.get('selected_center_dist'))} "
+        f"selected_center_prox={_fmt(selector_debug.get('selected_center_prox'))} "
+        f"selected_robot_prior_score={_fmt(selector_debug.get('selected_robot_prior_score'))} "
+        f"selected_robot_dist={_fmt(selector_debug.get('selected_robot_dist'))} "
+        f"selected_robot_prox={_fmt(selector_debug.get('selected_robot_prox'))} "
+        f"selected_robot_prior_valid={_fmt(selector_debug.get('selected_robot_prior_valid'))} "
+        f"selected_evidence_mass={_fmt(selector_debug.get('selected_evidence_mass'))} "
         f"selected_diagnostic_score={_fmt(selector_debug.get('selected_diagnostic_score'))} "
         f"reason={_fmt(selector_debug.get('reason'))}"
     )
@@ -279,6 +292,18 @@ def format_defense_selector_lines(step: int, result: Any) -> List[str]:
             f"bucket={_fmt(entry.get('bucket'))} "
             f"roi_grid={_fmt(entry.get('roi_grid'))} "
             f"raw_score={_fmt(entry.get('raw_score'))} "
+            f"final_score={_fmt(entry.get('final_score'))} "
+            f"evidence_score={_fmt(entry.get('evidence_score'))} "
+            f"env_prior_score={_fmt(entry.get('env_prior_score'))} "
+            f"center_dist={_fmt(entry.get('center_dist'))} "
+            f"center_prox={_fmt(entry.get('center_prox'))} "
+            f"final_env_prior_enabled={_fmt(entry.get('final_env_prior_enabled'))} "
+            f"robot_prior_score={_fmt(entry.get('robot_prior_score'))} "
+            f"robot_dist={_fmt(entry.get('robot_dist'))} "
+            f"robot_prox={_fmt(entry.get('robot_prox'))} "
+            f"robot_prior_valid={_fmt(entry.get('robot_prior_valid'))} "
+            f"final_robot_prior_enabled={_fmt(entry.get('final_robot_prior_enabled'))} "
+            f"evidence_mass={_fmt(entry.get('evidence_mass'))} "
             f"diagnostic_score={_fmt(entry.get('diagnostic_score'))} "
             f"area_ratio={_fmt(entry.get('area_ratio'))} "
             f"aspect={_fmt(entry.get('aspect'))} "
@@ -297,5 +322,4 @@ def format_defense_selector_lines(step: int, result: Any) -> List[str]:
         lines.append(line)
 
     return lines
-
 

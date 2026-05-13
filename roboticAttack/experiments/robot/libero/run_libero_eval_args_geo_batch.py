@@ -457,6 +457,30 @@ def _compute_frame_metrics_row(
         "quality_ok": dlog.get("quality_ok") if isinstance(dlog, dict) else None,
     }
 
+    selector_debug = dlog.get("selector_debug") if isinstance(dlog, dict) else None
+    if isinstance(selector_debug, dict):
+        for key in [
+            "use_final_score",
+            "final_env_prior_enabled",
+            "final_robot_prior_enabled",
+            "selected_raw_score",
+            "selected_final_score",
+            "selected_evidence_score",
+            "selected_env_prior_score",
+            "selected_center_dist",
+            "selected_center_prox",
+            "selected_robot_prior_score",
+            "selected_robot_dist",
+            "selected_robot_prox",
+            "selected_robot_prior_valid",
+            "selected_evidence_mass",
+            "selected_density",
+            "selected_peak",
+            "selected_area_ratio",
+            "selected_shape_penalty",
+        ]:
+            row[key] = selector_debug.get(key)
+
     try:
         eef = np.asarray(obs.get("robot0_eef_pos", []), dtype=np.float32).reshape(-1)
         if eef.size >= 3:
@@ -784,7 +808,11 @@ def eval_libero(cfg) -> None:
                     tau_patch_strength=getattr(cfg, "defense_tau_patch_strength", 0.05),
                     near_task_tau=getattr(cfg, "defense_near_task_tau", 0.08),
                     allow_near_task_patch=getattr(cfg, "defense_allow_near_task_patch", False),
-                    selector_debug_enabled=getattr(cfg, "defense_selector_debug_enabled", False),
+                    selector_debug_enabled=bool(
+                        getattr(cfg, "defense_selector_debug_enabled", False)
+                        or getattr(cfg, "defense_debug_selector", False)
+                        or getattr(cfg, "defense_debug", False)
+                    ),
                     selector_debug_topk=int(getattr(cfg, "defense_selector_debug_topk", 3)),
                     expected_patch_area_ratio=float(getattr(cfg, "defense_expected_patch_area_ratio", 0.04)),
                     patch_area_sigma=float(getattr(cfg, "defense_patch_area_sigma", 0.03)),
@@ -803,6 +831,15 @@ def eval_libero(cfg) -> None:
                     final_robot_prior_use_guard=bool(getattr(cfg, "defense_final_robot_prior_use_guard", True)),
                     final_robot_prior_use_core=bool(getattr(cfg, "defense_final_robot_prior_use_core", True)),
                 )
+                if bool(getattr(cfg, "defense_debug", False)) and bool(getattr(cfg, "defense_debug_selector", False)):
+                    print(
+                        "[DEBUG][PATCH_SELECTOR_CONFIG]",
+                        "final_robot_prior_enabled=", ps_cfg.final_robot_prior_enabled,
+                        "final_w_robot_dist=", ps_cfg.final_w_robot_dist,
+                        "final_w_robot_prox_penalty=", ps_cfg.final_w_robot_prox_penalty,
+                        "final_robot_sigma=", ps_cfg.final_robot_sigma,
+                        "selector_debug_enabled=", ps_cfg.selector_debug_enabled,
+                    )
                 patch_selector = PatchSelector(ps_cfg)
 
             if getattr(cfg, "defense_safety_region_enabled", True):

@@ -820,6 +820,17 @@ class OnlinePatchDefenseController:
                 or arm_core_grid_mask is not None
                 or arm_guard_grid_mask is not None
             ):
+                ps_cfg = getattr(self.patch_selector, "config", None)
+                if ps_cfg is not None and bool(getattr(ps_cfg, "selector_debug_enabled", False)):
+                    print(
+                        "[DEBUG][SELECT_INPUT]",
+                        "score_grid_is_none=", candidate_grid is None,
+                        "score_grid_shape=", getattr(candidate_grid, "shape", None),
+                        "arm_core_exists=", arm_core_grid_mask is not None,
+                        "arm_guard_exists=", arm_guard_grid_mask is not None,
+                        "gripper_core_exists=", gripper_core_grid_mask is not None,
+                        "gripper_guard_exists=", gripper_guard_grid_mask is not None,
+                    )
                 ps_res = self.patch_selector.select(
                     top_k_candidates,
                     G_grid=G_grid,
