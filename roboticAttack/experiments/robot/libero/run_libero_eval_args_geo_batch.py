@@ -849,6 +849,10 @@ def eval_libero(cfg) -> None:
                 patch_selector=patch_selector,
                 tau_protect=getattr(cfg, "defense_tau_protect", 0.1),
                 tau_cover=getattr(cfg, "defense_tau_cover", 0.5),
+                use_residual_candidate_grid=getattr(cfg, "defense_use_residual_candidate_grid", False),
+                geometry_residual_gamma=getattr(cfg, "defense_geometry_residual_gamma", 1.0),
+                geometry_guard_weight_arm=getattr(cfg, "defense_geometry_guard_weight_arm", 0.6),
+                geometry_guard_weight_gripper=getattr(cfg, "defense_geometry_guard_weight_gripper", 0.7),
             )
             defense_interface = UnifiedDefenseInterface(
                 hook=defense_hook,
@@ -1545,6 +1549,10 @@ def parse_args():
     parser.add_argument("--defense_corner_prior_sigma", type=float, default=0.35, help="Corner prior sigma for diagnostic scoring.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
+    parser.add_argument("--defense_use_residual_candidate_grid", type=str2bool, default=False, help="Use geometry-residualized stable grid for candidate proposal and final evidence scoring.")
+    parser.add_argument("--defense_geometry_residual_gamma", type=float, default=1.0, help="Exponent for geometry residual candidate-grid suppression.")
+    parser.add_argument("--defense_geometry_guard_weight_arm", type=float, default=0.6, help="Soft occupancy weight for arm guard cells in residual candidate-grid suppression.")
+    parser.add_argument("--defense_geometry_guard_weight_gripper", type=float, default=0.7, help="Soft occupancy weight for gripper guard cells in residual candidate-grid suppression.")
     parser.add_argument("--defense_arm_skeleton_enabled", type=str2bool, default=False, help="Enable arm skeleton prior built from simulator link poses.")
     parser.add_argument("--defense_arm_skeleton_source", type=str, default="body", choices=["body", "site"], help="Use body or site poses as keypoints for arm skeleton construction.")
     parser.add_argument("--defense_arm_body_names", type=str, default="base,link1,link2,link3,link4,link5,link6,link7,right_hand", help="Comma-separated body names for the arm skeleton keypoints.")
