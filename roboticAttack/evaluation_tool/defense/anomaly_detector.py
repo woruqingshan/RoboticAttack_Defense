@@ -169,6 +169,83 @@ def _pad_grid_box(box: GridBox, pad_cells: int, *, gw: int, gh: int) -> GridBox:
     return b.clamp(gw=int(gw), gh=int(gh))
 
 
+def build_soft_occupancy_grid(
+    grid_shape: Tuple[int, int],
+    *,
+    gripper_core_grid_mask: Optional[np.ndarray] = None,
+    gripper_guard_grid_mask: Optional[np.ndarray] = None,
+    arm_core_grid_mask: Optional[np.ndarray] = None,
+    arm_guard_grid_mask: Optional[np.ndarray] = None,
+    w_gripper_core: float = 1.0,
+    w_gripper_guard: float = 0.7,
+    w_arm_core: float = 1.0,
+    w_arm_guard: float = 0.6,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Build a soft robot/gripper geometry occupancy grid in [0, 1]."""
+    del eps  # Kept for signature compatibility and future numerical checks.
+    shape = (int(grid_shape[0]), int(grid_shape[1]))
+    r_grid = np.zeros(shape, dtype=np.float32)
+
+    def _add_mask(mask: Optional[np.ndarray], weight: float) -> None:
+        nonlocal r_grid
+        if mask is None:
+            return
+        try:
+            m = np.asarray(mask, dtype=np.float32)
+        except Exception:
+            return
+        if m.shape != shape:
+            return
+        r_grid = r_grid + float(weight) * m
+
+    _add_mask(gripper_core_grid_mask, w_gripper_core)
+    _add_mask(gripper_guard_grid_mask, w_gripper_guard)
+    _add_mask(arm_core_grid_mask, w_arm_core)
+    _add_mask(arm_guard_grid_mask, w_arm_guard)
+    return np.clip(r_grid, 0.0, 1.0).astype(np.float32)
+
+
+def geometry_residualize_grid(
+    stable_grid: np.ndarray,
+    R_grid: np.ndarray,
+    *,
+    gamma: float = 1.0,
+    normalize_mode: str = "original_sum",
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Suppress geometry-explainable attention with exp(-gamma * R)."""
+    z = np.asarray(stable_grid, dtype=np.float32)
+    if z.ndim != 2:
+        raise ValueError(f"stable_grid must be 2D, got shape={z.shape}")
+    r = np.asarray(R_grid, dtype=np.float32)
+    if r.shape != z.shape:
+        raise ValueError(f"R_grid shape {r.shape} does not match stable_grid shape {z.shape}")
+
+    z_nonnegative = z - float(np.min(z))
+    z_nonnegative = np.nan_to_num(z_nonnegative, nan=0.0, posinf=0.0, neginf=0.0)
+    r = np.clip(np.nan_to_num(r, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    gate = np.exp(-float(gamma) * r).astype(np.float32)
+    z_gated = z_nonnegative * gate
+
+    mode = str(normalize_mode).lower()
+    if mode == "original_sum":
+        denom = float(z_nonnegative.sum()) + float(eps)
+        z_res = z_gated / denom
+    elif mode == "gated_sum":
+        denom = float(z_gated.sum()) + float(eps)
+        z_res = z_gated / denom
+    elif mode == "none":
+        z_res = z_gated
+    else:
+        raise ValueError(
+            "normalize_mode must be one of {'original_sum', 'gated_sum', 'none'}, "
+            f"got {normalize_mode!r}"
+        )
+
+    return np.nan_to_num(z_res, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
 class PatchAttentionLocalizer:
     """
     Auto-mode localizer (v3): temporal mainland-vs-island localizer.
@@ -311,6 +388,7 @@ class DefenseDecision:
     conflict_mode: Optional[str] = None
     conflict_reason: str = ""
     conflict_stats: Optional[dict] = None
+    zres_debug: Optional[dict] = None
 
 
 class OnlinePatchDefenseController:
@@ -359,6 +437,13 @@ class OnlinePatchDefenseController:
         patch_selector: Optional[PatchSelector] = None,
         tau_protect: float = 0.1,  # Maximum allowed overlap ratio with G_px
         tau_cover: float = 0.5,    # Minimum required coverage ratio of original ROI
+        use_residual_candidate_grid: bool = False,
+        geometry_residual_gamma: float = 1.0,
+        geometry_guard_weight_arm: float = 0.6,
+        geometry_guard_weight_gripper: float = 0.7,
+        geometry_core_weight_arm: float = 1.0,
+        geometry_core_weight_gripper: float = 1.0,
+        geometry_residual_normalize_mode: str = "original_sum",
     ) -> None:
         self.hook = hook
         self.localizer = localizer
@@ -396,6 +481,13 @@ class OnlinePatchDefenseController:
         self.patch_selector = patch_selector
         self.tau_protect = float(tau_protect)
         self.tau_cover = float(tau_cover)
+        self.use_residual_candidate_grid = bool(use_residual_candidate_grid)
+        self.geometry_residual_gamma = float(geometry_residual_gamma)
+        self.geometry_guard_weight_arm = float(geometry_guard_weight_arm)
+        self.geometry_guard_weight_gripper = float(geometry_guard_weight_gripper)
+        self.geometry_core_weight_arm = float(geometry_core_weight_arm)
+        self.geometry_core_weight_gripper = float(geometry_core_weight_gripper)
+        self.geometry_residual_normalize_mode = str(geometry_residual_normalize_mode)
 
         # --- Simplified controller state (ACQUIRE/TRACK) ---
         self._tracking: bool = False
@@ -576,6 +668,53 @@ class OnlinePatchDefenseController:
                 if arm_guard_grid_mask is None:
                     arm_guard_grid_mask = safety_bundle.masks_grid.get("arm_guard", None)
 
+        stable_nonnegative = np.asarray(stable_grid, dtype=np.float32)
+        stable_nonnegative = stable_nonnegative - float(np.min(stable_nonnegative))
+        stable_nonnegative = np.nan_to_num(stable_nonnegative, nan=0.0, posinf=0.0, neginf=0.0)
+        stable_sum = float(stable_nonnegative.sum())
+        candidate_grid = stable_grid
+        zres_debug = {
+            "enabled": bool(self.use_residual_candidate_grid),
+            "mode": str(self.geometry_residual_normalize_mode),
+            "gamma": float(self.geometry_residual_gamma),
+            "stable_grid_sum": stable_sum,
+            "R_grid_min": None,
+            "R_grid_max": None,
+            "R_grid_sum": None,
+            "candidate_grid_sum": float(np.asarray(candidate_grid, dtype=np.float32).sum()),
+            "candidate_grid_max": float(np.asarray(candidate_grid, dtype=np.float32).max()),
+            "residual_retained_ratio": None,
+        }
+        if bool(self.use_residual_candidate_grid):
+            R_grid = build_soft_occupancy_grid(
+                stable_grid.shape,
+                gripper_core_grid_mask=gripper_core_grid_mask,
+                gripper_guard_grid_mask=gripper_guard_grid_mask,
+                arm_core_grid_mask=arm_core_grid_mask,
+                arm_guard_grid_mask=arm_guard_grid_mask,
+                w_gripper_core=float(self.geometry_core_weight_gripper),
+                w_gripper_guard=float(self.geometry_guard_weight_gripper),
+                w_arm_core=float(self.geometry_core_weight_arm),
+                w_arm_guard=float(self.geometry_guard_weight_arm),
+            )
+            candidate_grid = geometry_residualize_grid(
+                stable_grid,
+                R_grid,
+                gamma=float(self.geometry_residual_gamma),
+                normalize_mode=str(self.geometry_residual_normalize_mode),
+            )
+            candidate_sum = float(np.asarray(candidate_grid, dtype=np.float32).sum())
+            zres_debug.update(
+                {
+                    "R_grid_min": float(R_grid.min()) if R_grid.size > 0 else 0.0,
+                    "R_grid_max": float(R_grid.max()) if R_grid.size > 0 else 0.0,
+                    "R_grid_sum": float(R_grid.sum()),
+                    "candidate_grid_sum": candidate_sum,
+                    "candidate_grid_max": float(candidate_grid.max()) if candidate_grid.size > 0 else 0.0,
+                    "residual_retained_ratio": float(candidate_sum / (stable_sum + 1e-6)),
+                }
+            )
+
         # ---------------------------------------------------------------------
         # LOCKED MODE (Multimodal or PRAC):
         # - First step: localize + select best patch ROI, lock it.
@@ -697,11 +836,12 @@ class OnlinePatchDefenseController:
                 conflict_mode=conflict_mode,
                 conflict_reason=str(conflict_reason),
                 conflict_stats=conflict_stats,
+                zres_debug=zres_debug,
             )
 
         if not bool(self._locked):
             # One-time ACQUIRE + Lock.
-            tlr = self.localizer.localize(stable_grid)
+            tlr = self.localizer.localize(candidate_grid)
             top_k_candidates = getattr(tlr, "top_k_candidates", [])
             if (not top_k_candidates) and (tlr.outlier_roi is not None):
                 top_k_candidates = [(tlr.outlier_roi, float(tlr.outlier_score))]
@@ -777,6 +917,7 @@ class OnlinePatchDefenseController:
                         arm_link_segments_2d=arm_link_segments_2d,
                         arm_link_name_pairs=arm_link_name_pairs,
                         arm_link_quads_2d=arm_link_quads_2d,
+                        zres_debug=zres_debug,
                     )
             else:
                 # Fallback: Top-1
@@ -906,6 +1047,7 @@ class OnlinePatchDefenseController:
                     conflict_mode=conflict_mode,
                     conflict_reason=str(conflict_reason),
                     conflict_stats=conflict_stats,
+                    zres_debug=zres_debug,
                 )
 
         # --- (B) ACQUIRE/TRACK controller (Legacy continuous tracking) ---
@@ -924,7 +1066,7 @@ class OnlinePatchDefenseController:
         if (not bool(self._tracking)) or bool(self._reacquire_needed):
             # ACQUIRE phase: Top-K parallel PRAC evaluation
             # Step 1: Localize to get top-K candidates
-            tlr = self.localizer.localize(stable_grid)
+            tlr = self.localizer.localize(candidate_grid)
             top_k_candidates = getattr(tlr, "top_k_candidates", [])
             main_grid = tlr.main_roi
             
@@ -1111,6 +1253,7 @@ class OnlinePatchDefenseController:
                 arm_link_segments_2d=arm_link_segments_2d,
                 arm_link_name_pairs=arm_link_name_pairs,
                 arm_link_quads_2d=arm_link_quads_2d,
+                zres_debug=zres_debug,
             )
 
         # --- (C0) map ROI grid -> pixel PatchBox early (needed for heatmap-space quality gate) ---
@@ -1240,6 +1383,7 @@ class OnlinePatchDefenseController:
                 arm_link_segments_2d=arm_link_segments_2d,
                 arm_link_name_pairs=arm_link_name_pairs,
                 arm_link_quads_2d=arm_link_quads_2d,
+                zres_debug=zres_debug,
             )
             # Enter TRACK
             self._tracking = True
@@ -1353,6 +1497,7 @@ class OnlinePatchDefenseController:
             arm_link_segments_2d=arm_link_segments_2d,
             arm_link_name_pairs=arm_link_name_pairs,
             arm_link_quads_2d=arm_link_quads_2d,
+            zres_debug=zres_debug,
         )
 
 
@@ -1414,6 +1559,7 @@ class UnifiedDefenseResult:
     conflict_mode: Optional[str] = None
     conflict_reason: str = ""
     conflict_stats: Optional[dict] = None
+    zres_debug: Optional[dict] = None
 
 
 class UnifiedDefenseInterface:
@@ -1575,4 +1721,5 @@ class UnifiedDefenseInterface:
             conflict_mode=getattr(dd, "conflict_mode", None),
             conflict_reason=str(getattr(dd, "conflict_reason", "")),
             conflict_stats=getattr(dd, "conflict_stats", None),
+            zres_debug=getattr(dd, "zres_debug", None),
         )

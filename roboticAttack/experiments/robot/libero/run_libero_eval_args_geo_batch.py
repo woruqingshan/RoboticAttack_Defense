@@ -161,6 +161,34 @@ def _defense_debug_geometry(cfg) -> bool:
     """Return True when verbose geometry debug logs are enabled."""
     return bool(getattr(cfg, "defense_debug", False) and getattr(cfg, "defense_debug_geometry", False))
 
+
+def _format_zres_debug_line(step: int, zres_debug) -> str:
+    """Format geometry residual attention debug fields."""
+    if not isinstance(zres_debug, dict):
+        zres_debug = {}
+
+    def _fmt(value):
+        if value is None:
+            return "None"
+        if isinstance(value, float):
+            return f"{value:.6f}"
+        return str(value)
+
+    return (
+        f"[DEFENSE][ZRES] step={int(step)} "
+        f"enabled={_fmt(zres_debug.get('enabled', False))} "
+        f"mode={_fmt(zres_debug.get('mode'))} "
+        f"gamma={_fmt(zres_debug.get('gamma'))} "
+        f"stable_sum={_fmt(zres_debug.get('stable_grid_sum'))} "
+        f"R_min={_fmt(zres_debug.get('R_grid_min'))} "
+        f"R_max={_fmt(zres_debug.get('R_grid_max'))} "
+        f"R_sum={_fmt(zres_debug.get('R_grid_sum'))} "
+        f"candidate_sum={_fmt(zres_debug.get('candidate_grid_sum'))} "
+        f"candidate_max={_fmt(zres_debug.get('candidate_grid_max'))} "
+        f"retained_ratio={_fmt(zres_debug.get('residual_retained_ratio'))}"
+    )
+
+
 def _normalize_heatmap_uint8(heatmap) -> "np.ndarray":
     """Normalize a float heatmap into uint8 [0,255] for visualization."""
     hm = heatmap.astype(np.float32)
@@ -849,6 +877,13 @@ def eval_libero(cfg) -> None:
                 patch_selector=patch_selector,
                 tau_protect=getattr(cfg, "defense_tau_protect", 0.1),
                 tau_cover=getattr(cfg, "defense_tau_cover", 0.5),
+                use_residual_candidate_grid=getattr(cfg, "defense_use_residual_candidate_grid", False),
+                geometry_residual_gamma=getattr(cfg, "defense_geometry_residual_gamma", 1.0),
+                geometry_guard_weight_arm=getattr(cfg, "defense_geometry_guard_weight_arm", 0.6),
+                geometry_guard_weight_gripper=getattr(cfg, "defense_geometry_guard_weight_gripper", 0.7),
+                geometry_core_weight_arm=getattr(cfg, "defense_geometry_core_weight_arm", 1.0),
+                geometry_core_weight_gripper=getattr(cfg, "defense_geometry_core_weight_gripper", 1.0),
+                geometry_residual_normalize_mode=getattr(cfg, "defense_geometry_residual_normalize_mode", "original_sum"),
             )
             defense_interface = UnifiedDefenseInterface(
                 hook=defense_hook,
@@ -1118,6 +1153,11 @@ def eval_libero(cfg) -> None:
                             _defense_debug_print(
                                 cfg,
                                 f"[DEFENSE] {format_defense_log_line(step=int(t), result=defense_result)}",
+                                log_file=log_file,
+                            )
+                            _defense_debug_print(
+                                cfg,
+                                _format_zres_debug_line(step=int(t), zres_debug=getattr(defense_result, "zres_debug", None)),
                                 log_file=log_file,
                             )
                         if _defense_debug_geometry(cfg):
@@ -1543,6 +1583,19 @@ def parse_args():
         help="Corner prior type (top_right|top_left|bottom_right|bottom_left|none).",
     )
     parser.add_argument("--defense_corner_prior_sigma", type=float, default=0.35, help="Corner prior sigma for diagnostic scoring.")
+    parser.add_argument("--defense_use_residual_candidate_grid", type=str2bool, default=False, help="Use geometry residual attention map as the localizer input.")
+    parser.add_argument("--defense_geometry_residual_gamma", type=float, default=1.0, help="Suppression strength for exp(-gamma * occupancy) in residual attention.")
+    parser.add_argument("--defense_geometry_guard_weight_arm", type=float, default=0.6, help="Soft occupancy weight for arm guard grid cells.")
+    parser.add_argument("--defense_geometry_guard_weight_gripper", type=float, default=0.7, help="Soft occupancy weight for gripper guard grid cells.")
+    parser.add_argument("--defense_geometry_core_weight_arm", type=float, default=1.0, help="Soft occupancy weight for arm core grid cells.")
+    parser.add_argument("--defense_geometry_core_weight_gripper", type=float, default=1.0, help="Soft occupancy weight for gripper core grid cells.")
+    parser.add_argument(
+        "--defense_geometry_residual_normalize_mode",
+        type=str,
+        default="original_sum",
+        choices=["original_sum", "gated_sum", "none"],
+        help="Normalization mode for residual attention: original_sum, gated_sum, or none.",
+    )
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
     parser.add_argument("--defense_arm_skeleton_enabled", type=str2bool, default=False, help="Enable arm skeleton prior built from simulator link poses.")
