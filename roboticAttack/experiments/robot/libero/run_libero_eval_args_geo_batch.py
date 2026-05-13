@@ -792,6 +792,10 @@ def eval_libero(cfg) -> None:
                     corner_prior_enabled=bool(getattr(cfg, "defense_corner_prior_enabled", False)),
                     corner_prior_type=str(getattr(cfg, "defense_corner_prior_type", "top_right")),
                     corner_prior_sigma=float(getattr(cfg, "defense_corner_prior_sigma", 0.35)),
+                    final_env_prior_enabled=bool(getattr(cfg, "defense_final_env_prior_enabled", False)),
+                    final_w_dist=float(getattr(cfg, "defense_final_w_dist", 0.0)),
+                    final_w_center_penalty=float(getattr(cfg, "defense_final_w_center_penalty", 0.0)),
+                    final_center_sigma=float(getattr(cfg, "defense_final_center_sigma", 0.35)),
                 )
                 patch_selector = PatchSelector(ps_cfg)
 
@@ -1547,6 +1551,11 @@ def parse_args():
         help="Corner prior type (top_right|top_left|bottom_right|bottom_left|none).",
     )
     parser.add_argument("--defense_corner_prior_sigma", type=float, default=0.35, help="Corner prior sigma for diagnostic scoring.")
+    parser.add_argument("--defense_final_env_prior_enabled", type=str2bool, default=False, help="Enable soft environmental prior only for PatchSelector final re-ranking.")
+    parser.add_argument("--defense_final_w_dist", type=float, default=0.0, help="Weight for normalized distance from grid center in PatchSelector final re-ranking.")
+    parser.add_argument("--defense_final_w_center_penalty", type=float, default=0.0, help="Penalty weight for center proximity in PatchSelector final re-ranking.")
+    parser.add_argument("--defense_final_center_sigma", type=float, default=0.35, help="Center proximity sigma for PatchSelector final environmental prior.")
+    parser.add_argument("--defense_localizer_top_k", type=int, default=3, help="Requested localizer Top-K count when the active localizer constructor supports it.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
     parser.add_argument("--defense_use_residual_candidate_grid", type=str2bool, default=False, help="Use geometry-residualized stable grid for candidate proposal and final evidence scoring.")

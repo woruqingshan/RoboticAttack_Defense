@@ -123,6 +123,31 @@ def _compute_corner_prior(
     return float(math.exp(-(z * z)))
 
 
+def _compute_roi_center_features(
+    roi: GridBox,
+    grid_h: int,
+    grid_w: int,
+    sigma: float,
+) -> Dict[str, float]:
+    """Compute normalized ROI distance and proximity to the grid center."""
+    eps = 1e-8
+    cx = (float(roi.gx0) + float(roi.gx1)) * 0.5
+    cy = (float(roi.gy0) + float(roi.gy1)) * 0.5
+
+    grid_cx = (float(grid_w) - 1.0) * 0.5
+    grid_cy = (float(grid_h) - 1.0) * 0.5
+
+    diag = math.sqrt((float(grid_w) - 1.0) ** 2 + (float(grid_h) - 1.0) ** 2) + eps
+    center_dist = math.sqrt((cx - grid_cx) ** 2 + (cy - grid_cy) ** 2) / diag
+    sigma_safe = max(float(sigma), 0.0)
+    center_prox = math.exp(-((center_dist * center_dist) / (2.0 * sigma_safe * sigma_safe + eps)))
+
+    return {
+        "center_dist": float(center_dist),
+        "center_prox": float(center_prox),
+    }
+
+
 def _compute_candidate_evidence_score(
     roi: GridBox,
     score_grid: np.ndarray,
@@ -139,6 +164,11 @@ def _compute_candidate_evidence_score(
             "density": 0.0,
             "aspect": 0.0,
             "shape_penalty": 0.0,
+            "evidence_score": 0.0,
+            "env_prior_score": 0.0,
+            "center_dist": 0.0,
+            "center_prox": 0.0,
+            "final_env_prior_enabled": bool(getattr(config, "final_env_prior_enabled", False)),
             "final_score": 0.0,
         }
 
@@ -162,13 +192,34 @@ def _compute_candidate_evidence_score(
         mass = float(roi_grid.sum() / total)
         peak = float(roi_grid.max() / global_peak) if roi_grid.size > 0 else 0.0
     density = float(mass / (area_ratio + eps))
-    final_score = (
+    evidence_score = (
         float(config.final_w_mass) * mass
         + float(config.final_w_density) * (density / (density + 1.0))
         + float(config.final_w_peak) * peak
         - float(config.final_w_area) * math.sqrt(max(area_ratio, 0.0))
         - float(config.final_w_shape) * shape_penalty
     )
+
+    final_env_prior_enabled = bool(getattr(config, "final_env_prior_enabled", False))
+    if final_env_prior_enabled:
+        center_feats = _compute_roi_center_features(
+            roi,
+            grid_h=gh,
+            grid_w=gw,
+            sigma=float(getattr(config, "final_center_sigma", 0.35)),
+        )
+        center_dist = float(center_feats["center_dist"])
+        center_prox = float(center_feats["center_prox"])
+        env_prior_score = (
+            float(getattr(config, "final_w_dist", 0.0)) * center_dist
+            - float(getattr(config, "final_w_center_penalty", 0.0)) * center_prox
+        )
+    else:
+        center_dist = 0.0
+        center_prox = 0.0
+        env_prior_score = 0.0
+
+    final_score = float(evidence_score + env_prior_score)
     return {
         "mass": float(mass),
         "peak": float(peak),
@@ -176,6 +227,11 @@ def _compute_candidate_evidence_score(
         "density": float(density),
         "aspect": float(aspect),
         "shape_penalty": float(shape_penalty),
+        "evidence_score": float(evidence_score),
+        "env_prior_score": float(env_prior_score),
+        "center_dist": float(center_dist),
+        "center_prox": float(center_prox),
+        "final_env_prior_enabled": bool(final_env_prior_enabled),
         "final_score": float(final_score),
     }
 
@@ -208,6 +264,10 @@ class PatchSelectorConfig:
     final_w_area: float = 0.2
     final_w_shape: float = 0.2
     use_final_score: bool = True
+    final_env_prior_enabled: bool = False
+    final_w_dist: float = 0.0
+    final_w_center_penalty: float = 0.0
+    final_center_sigma: float = 0.35
 
 class PatchSelector:
     def __init__(self, config: PatchSelectorConfig):
@@ -257,6 +317,7 @@ class PatchSelector:
         selector_debug = {
             "enabled": bool(getattr(self.config, "selector_debug_enabled", False)),
             "use_final_score": bool(use_final_score),
+            "final_env_prior_enabled": bool(getattr(self.config, "final_env_prior_enabled", False)),
             "topk": [],
             "selected": None,
             "selected_bucket": None,
@@ -264,6 +325,10 @@ class PatchSelector:
             "selected_raw_score": None,
             "selected_diagnostic_score": None,
             "selected_final_score": None,
+            "selected_evidence_score": None,
+            "selected_env_prior_score": None,
+            "selected_center_dist": None,
+            "selected_center_prox": None,
             "selected_evidence_mass": None,
             "selected_density": None,
             "selected_peak": None,
@@ -324,6 +389,10 @@ class PatchSelector:
             selector_debug["selected_bucket"] = bucket
             selector_debug["selected_raw_score"] = float(candidate["raw_score"])
             selector_debug["selected_final_score"] = candidate.get("final_score")
+            selector_debug["selected_evidence_score"] = candidate.get("evidence_score")
+            selector_debug["selected_env_prior_score"] = candidate.get("env_prior_score")
+            selector_debug["selected_center_dist"] = candidate.get("center_dist")
+            selector_debug["selected_center_prox"] = candidate.get("center_prox")
             selector_debug["selected_evidence_mass"] = candidate.get("evidence_mass")
             selector_debug["selected_density"] = candidate.get("density")
             selector_debug["selected_peak"] = candidate.get("peak")
@@ -380,6 +449,11 @@ class PatchSelector:
                 "density": None,
                 "aspect": float(aspect),
                 "shape_penalty": None,
+                "evidence_score": None,
+                "env_prior_score": None,
+                "center_dist": None,
+                "center_prox": None,
+                "final_env_prior_enabled": bool(getattr(self.config, "final_env_prior_enabled", False)),
                 "final_score": None,
             }
             if use_final_score:
@@ -394,6 +468,11 @@ class PatchSelector:
                 "roi": roi,
                 "raw_score": float(raw_score),
                 "final_score": evidence.get("final_score") if use_final_score else None,
+                "evidence_score": evidence.get("evidence_score") if use_final_score else None,
+                "env_prior_score": evidence.get("env_prior_score") if use_final_score else None,
+                "center_dist": evidence.get("center_dist") if use_final_score else None,
+                "center_prox": evidence.get("center_prox") if use_final_score else None,
+                "final_env_prior_enabled": bool(evidence.get("final_env_prior_enabled", False)) if use_final_score else False,
                 "evidence_mass": evidence.get("mass") if use_final_score else None,
                 "density": evidence.get("density") if use_final_score else None,
                 "peak": evidence.get("peak") if use_final_score else None,
@@ -443,6 +522,11 @@ class PatchSelector:
                     "roi_grid": _roi_grid_dict(roi, grid_h=grid_h, grid_w=grid_w),
                     "raw_score": float(raw_score),
                     "final_score": candidate.get("final_score"),
+                    "evidence_score": candidate.get("evidence_score"),
+                    "env_prior_score": candidate.get("env_prior_score"),
+                    "center_dist": candidate.get("center_dist"),
+                    "center_prox": candidate.get("center_prox"),
+                    "final_env_prior_enabled": bool(candidate.get("final_env_prior_enabled", False)),
                     "evidence_mass": candidate.get("evidence_mass"),
                     "density": candidate.get("density"),
                     "peak": candidate.get("peak"),
