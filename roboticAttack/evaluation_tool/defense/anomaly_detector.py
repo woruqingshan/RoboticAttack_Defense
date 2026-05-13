@@ -169,6 +169,64 @@ def _pad_grid_box(box: GridBox, pad_cells: int, *, gw: int, gh: int) -> GridBox:
     return b.clamp(gw=int(gw), gh=int(gh))
 
 
+def build_soft_occupancy_grid(
+    stable_grid_shape: Tuple[int, int],
+    gripper_core_grid_mask: Optional[np.ndarray] = None,
+    gripper_guard_grid_mask: Optional[np.ndarray] = None,
+    arm_core_grid_mask: Optional[np.ndarray] = None,
+    arm_guard_grid_mask: Optional[np.ndarray] = None,
+    w_gripper_guard: float = 0.7,
+    w_arm_guard: float = 0.6,
+) -> np.ndarray:
+    """Build a soft geometry occupancy grid in [0, 1].
+
+    Core regions are treated as fully occupied. Guard regions are softer
+    penalties and are fused with max so overlapping geometry never reduces
+    occupancy.
+    """
+    shape = (int(stable_grid_shape[0]), int(stable_grid_shape[1]))
+    r_grid = np.zeros(shape, dtype=np.float32)
+
+    def _apply(mask: Optional[np.ndarray], value: float) -> None:
+        nonlocal r_grid
+        if mask is None:
+            return
+        try:
+            m = np.asarray(mask).astype(bool)
+        except Exception:
+            return
+        if m.shape != shape:
+            return
+        r_grid = np.maximum(r_grid, m.astype(np.float32) * float(value))
+
+    _apply(gripper_guard_grid_mask, float(w_gripper_guard))
+    _apply(arm_guard_grid_mask, float(w_arm_guard))
+    _apply(gripper_core_grid_mask, 1.0)
+    _apply(arm_core_grid_mask, 1.0)
+    return np.clip(r_grid, 0.0, 1.0).astype(np.float32)
+
+
+def geometry_residualize_grid(
+    stable_grid: np.ndarray,
+    R_grid: np.ndarray,
+    gamma: float = 1.0,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Suppress geometry-occupied cells while preserving free-space evidence."""
+    g = np.asarray(stable_grid, dtype=np.float32)
+    r = np.asarray(R_grid, dtype=np.float32)
+    if g.ndim != 2 or r.shape != g.shape:
+        return g.copy()
+    G = g - float(np.nanmin(g))
+    G = np.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
+    gate = np.clip(1.0 - r, 0.0, 1.0) ** float(gamma)
+    z_res = G * gate.astype(np.float32)
+    total = float(z_res.sum())
+    if total > float(eps):
+        z_res = z_res / total
+    return z_res.astype(np.float32)
+
+
 class PatchAttentionLocalizer:
     """
     Auto-mode localizer (v3): temporal mainland-vs-island localizer.
@@ -359,6 +417,10 @@ class OnlinePatchDefenseController:
         patch_selector: Optional[PatchSelector] = None,
         tau_protect: float = 0.1,  # Maximum allowed overlap ratio with G_px
         tau_cover: float = 0.5,    # Minimum required coverage ratio of original ROI
+        use_residual_candidate_grid: bool = False,
+        geometry_residual_gamma: float = 1.0,
+        geometry_guard_weight_arm: float = 0.6,
+        geometry_guard_weight_gripper: float = 0.7,
     ) -> None:
         self.hook = hook
         self.localizer = localizer
@@ -396,6 +458,10 @@ class OnlinePatchDefenseController:
         self.patch_selector = patch_selector
         self.tau_protect = float(tau_protect)
         self.tau_cover = float(tau_cover)
+        self.use_residual_candidate_grid = bool(use_residual_candidate_grid)
+        self.geometry_residual_gamma = float(geometry_residual_gamma)
+        self.geometry_guard_weight_arm = float(geometry_guard_weight_arm)
+        self.geometry_guard_weight_gripper = float(geometry_guard_weight_gripper)
 
         # --- Simplified controller state (ACQUIRE/TRACK) ---
         self._tracking: bool = False
@@ -576,6 +642,39 @@ class OnlinePatchDefenseController:
                 if arm_guard_grid_mask is None:
                     arm_guard_grid_mask = safety_bundle.masks_grid.get("arm_guard", None)
 
+        candidate_grid = stable_grid
+        residual_debug = {
+            "use_residual_candidate_grid": bool(self.use_residual_candidate_grid),
+            "geometry_residual_gamma": float(self.geometry_residual_gamma),
+            "R_grid_mean": None,
+            "R_grid_max": None,
+            "candidate_grid_sum": float(np.asarray(candidate_grid, dtype=np.float32).sum()),
+            "candidate_grid_max": float(np.asarray(candidate_grid, dtype=np.float32).max()),
+        }
+        if bool(self.use_residual_candidate_grid):
+            R_grid = build_soft_occupancy_grid(
+                stable_grid_shape=stable_grid.shape,
+                gripper_core_grid_mask=gripper_core_grid_mask,
+                gripper_guard_grid_mask=gripper_guard_grid_mask,
+                arm_core_grid_mask=arm_core_grid_mask,
+                arm_guard_grid_mask=arm_guard_grid_mask,
+                w_gripper_guard=float(self.geometry_guard_weight_gripper),
+                w_arm_guard=float(self.geometry_guard_weight_arm),
+            )
+            candidate_grid = geometry_residualize_grid(
+                stable_grid,
+                R_grid,
+                gamma=float(self.geometry_residual_gamma),
+            )
+            residual_debug.update(
+                {
+                    "R_grid_mean": float(R_grid.mean()),
+                    "R_grid_max": float(R_grid.max()),
+                    "candidate_grid_sum": float(candidate_grid.sum()),
+                    "candidate_grid_max": float(candidate_grid.max()) if candidate_grid.size > 0 else 0.0,
+                }
+            )
+
         # ---------------------------------------------------------------------
         # LOCKED MODE (Multimodal or PRAC):
         # - First step: localize + select best patch ROI, lock it.
@@ -678,6 +777,7 @@ class OnlinePatchDefenseController:
                 prac_stats=None,
                 gripper_box=gripper_box,
                 patch_verdict=getattr(self, "_locked_patch_verdict", "PATCH_FOUND"),
+                selector_debug={"residual_candidate_grid": dict(residual_debug)},
                 arm_region_box=arm_region_box,
                 arm_core_box=arm_core_box,
                 arm_guard_box=arm_guard_box,
@@ -701,7 +801,7 @@ class OnlinePatchDefenseController:
 
         if not bool(self._locked):
             # One-time ACQUIRE + Lock.
-            tlr = self.localizer.localize(stable_grid)
+            tlr = self.localizer.localize(candidate_grid)
             top_k_candidates = getattr(tlr, "top_k_candidates", [])
             if (not top_k_candidates) and (tlr.outlier_roi is not None):
                 top_k_candidates = [(tlr.outlier_roi, float(tlr.outlier_score))]
@@ -713,9 +813,12 @@ class OnlinePatchDefenseController:
 
             # Step 2: PatchSelector (filter by gripper / arm masks, with G_grid kept as fallback)
             if self.patch_selector is not None and (
-                G_grid is not None
+                bool(self.use_residual_candidate_grid)
+                or G_grid is not None
                 or gripper_core_grid_mask is not None
                 or gripper_guard_grid_mask is not None
+                or arm_core_grid_mask is not None
+                or arm_guard_grid_mask is not None
             ):
                 ps_res = self.patch_selector.select(
                     top_k_candidates,
@@ -725,12 +828,16 @@ class OnlinePatchDefenseController:
                     arm_region_grid=arm_region_grid,
                     arm_core_grid_mask=arm_core_grid_mask,
                     arm_guard_grid_mask=arm_guard_grid_mask,
-                    score_grid=stable_grid,
+                    score_grid=candidate_grid,
                 )
                 patch_verdict_str = ps_res.verdict
                 best_roi = ps_res.roi
                 best_reason = ps_res.reason
                 selector_debug = getattr(ps_res, "debug", None)
+                if isinstance(selector_debug, dict):
+                    selector_debug["residual_candidate_grid"] = dict(residual_debug)
+                else:
+                    selector_debug = {"residual_candidate_grid": dict(residual_debug)}
 
                 if patch_verdict_str == "NO_PATCH":
                     # Step 3: NO_PATCH -> return without purifying
@@ -785,6 +892,7 @@ class OnlinePatchDefenseController:
                     best_roi, _ = top_k_candidates[0]
                     best_reason = "lock_fallback_top1"
                     patch_verdict_str = "PATCH_FOUND"
+                    selector_debug = {"residual_candidate_grid": dict(residual_debug)}
 
             if best_roi is not None:
                 # Lock ROI for the rest of the episode.
@@ -925,7 +1033,7 @@ class OnlinePatchDefenseController:
         if (not bool(self._tracking)) or bool(self._reacquire_needed):
             # ACQUIRE phase: Top-K parallel PRAC evaluation
             # Step 1: Localize to get top-K candidates
-            tlr = self.localizer.localize(stable_grid)
+            tlr = self.localizer.localize(candidate_grid)
             top_k_candidates = getattr(tlr, "top_k_candidates", [])
             main_grid = tlr.main_roi
             
@@ -1097,6 +1205,7 @@ class OnlinePatchDefenseController:
                 prac_mer=prac_mer,
                 prac_stats=prac_stats_dict,
                 gripper_box=gripper_box,
+                selector_debug={"residual_candidate_grid": dict(residual_debug)},
                 arm_region_box=arm_region_box,
                 arm_core_box=arm_core_box,
                 arm_guard_box=arm_guard_box,
@@ -1226,6 +1335,7 @@ class OnlinePatchDefenseController:
                 prac_stats=prac_stats_dict,
                 gripper_box=gripper_box,
                 patch_verdict=None,
+                selector_debug={"residual_candidate_grid": dict(residual_debug)},
                 arm_region_box=arm_region_box,
                 arm_core_box=arm_core_box,
                 arm_guard_box=arm_guard_box,
@@ -1339,6 +1449,7 @@ class OnlinePatchDefenseController:
             prac_stats=prac_stats_dict,
             gripper_box=gripper_box,
             patch_verdict=None,
+            selector_debug={"residual_candidate_grid": dict(residual_debug)},
             arm_region_box=arm_region_box,
             arm_core_box=arm_core_box,
             arm_guard_box=arm_guard_box,
