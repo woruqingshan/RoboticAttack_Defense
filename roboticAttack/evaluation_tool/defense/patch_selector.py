@@ -148,6 +148,83 @@ def _compute_roi_center_features(
     }
 
 
+def _compute_roi_robot_distance_features(
+    roi: GridBox,
+    grid_h: int,
+    grid_w: int,
+    gripper_core_grid_mask: Optional[object] = None,
+    gripper_guard_grid_mask: Optional[object] = None,
+    arm_core_grid_mask: Optional[object] = None,
+    arm_guard_grid_mask: Optional[object] = None,
+    sigma: float = 0.35,
+    use_core: bool = True,
+    use_guard: bool = True,
+) -> Dict[str, float]:
+    """Compute normalized ROI distance and proximity to robot geometry masks."""
+    eps = 1e-8
+    if grid_h <= 0 or grid_w <= 0:
+        return {"robot_dist": 0.0, "robot_prox": 0.0, "robot_prior_valid": False}
+
+    robot_mask = np.zeros((int(grid_h), int(grid_w)), dtype=bool)
+
+    def _merge(mask_obj: Optional[object]) -> None:
+        nonlocal robot_mask
+        if mask_obj is None:
+            return
+        try:
+            mask = np.asarray(mask_obj).astype(bool)
+        except Exception:
+            return
+        if mask.shape != robot_mask.shape:
+            return
+        robot_mask = np.logical_or(robot_mask, mask)
+
+    if bool(use_core):
+        _merge(gripper_core_grid_mask)
+        _merge(arm_core_grid_mask)
+    if bool(use_guard):
+        _merge(gripper_guard_grid_mask)
+        _merge(arm_guard_grid_mask)
+
+    if not bool(robot_mask.any()):
+        return {"robot_dist": 0.0, "robot_prox": 0.0, "robot_prior_valid": False}
+
+    y0, y1 = max(0, int(roi.gy0)), min(int(roi.gy1), int(grid_h))
+    x0, x1 = max(0, int(roi.gx0)), min(int(roi.gx1), int(grid_w))
+    if x1 <= x0 or y1 <= y0:
+        return {"robot_dist": 0.0, "robot_prox": 0.0, "robot_prior_valid": False}
+
+    roi_ys, roi_xs = np.indices((y1 - y0, x1 - x0), dtype=np.float32)
+    roi_points = np.stack(
+        [
+            roi_xs.reshape(-1) + float(x0) + 0.5,
+            roi_ys.reshape(-1) + float(y0) + 0.5,
+        ],
+        axis=1,
+    )
+    robot_y, robot_x = np.where(robot_mask)
+    robot_points = np.stack(
+        [
+            robot_x.astype(np.float32) + 0.5,
+            robot_y.astype(np.float32) + 0.5,
+        ],
+        axis=1,
+    )
+
+    diff = roi_points[:, None, :] - robot_points[None, :, :]
+    min_distance = float(np.sqrt(np.sum(diff * diff, axis=2)).min())
+    diag = math.sqrt((float(grid_w) - 1.0) ** 2 + (float(grid_h) - 1.0) ** 2) + eps
+    robot_dist = float(min_distance / diag)
+    sigma_safe = max(float(sigma), 0.0)
+    robot_prox = float(math.exp(-((robot_dist * robot_dist) / (2.0 * sigma_safe * sigma_safe + eps))))
+
+    return {
+        "robot_dist": float(robot_dist),
+        "robot_prox": float(robot_prox),
+        "robot_prior_valid": True,
+    }
+
+
 def _compute_candidate_evidence_score(
     roi: GridBox,
     score_grid: np.ndarray,
@@ -268,6 +345,12 @@ class PatchSelectorConfig:
     final_w_dist: float = 0.0
     final_w_center_penalty: float = 0.0
     final_center_sigma: float = 0.35
+    final_robot_prior_enabled: bool = False
+    final_w_robot_dist: float = 0.0
+    final_w_robot_prox_penalty: float = 0.0
+    final_robot_sigma: float = 0.35
+    final_robot_prior_use_guard: bool = True
+    final_robot_prior_use_core: bool = True
 
 class PatchSelector:
     def __init__(self, config: PatchSelectorConfig):
@@ -318,6 +401,7 @@ class PatchSelector:
             "enabled": bool(getattr(self.config, "selector_debug_enabled", False)),
             "use_final_score": bool(use_final_score),
             "final_env_prior_enabled": bool(getattr(self.config, "final_env_prior_enabled", False)),
+            "final_robot_prior_enabled": bool(getattr(self.config, "final_robot_prior_enabled", False)),
             "topk": [],
             "selected": None,
             "selected_bucket": None,
@@ -329,6 +413,10 @@ class PatchSelector:
             "selected_env_prior_score": None,
             "selected_center_dist": None,
             "selected_center_prox": None,
+            "selected_robot_prior_score": None,
+            "selected_robot_dist": None,
+            "selected_robot_prox": None,
+            "selected_robot_prior_valid": None,
             "selected_evidence_mass": None,
             "selected_density": None,
             "selected_peak": None,
@@ -393,6 +481,10 @@ class PatchSelector:
             selector_debug["selected_env_prior_score"] = candidate.get("env_prior_score")
             selector_debug["selected_center_dist"] = candidate.get("center_dist")
             selector_debug["selected_center_prox"] = candidate.get("center_prox")
+            selector_debug["selected_robot_prior_score"] = candidate.get("robot_prior_score")
+            selector_debug["selected_robot_dist"] = candidate.get("robot_dist")
+            selector_debug["selected_robot_prox"] = candidate.get("robot_prox")
+            selector_debug["selected_robot_prior_valid"] = candidate.get("robot_prior_valid")
             selector_debug["selected_evidence_mass"] = candidate.get("evidence_mass")
             selector_debug["selected_density"] = candidate.get("density")
             selector_debug["selected_peak"] = candidate.get("peak")
@@ -459,6 +551,36 @@ class PatchSelector:
             if use_final_score:
                 evidence = _compute_candidate_evidence_score(roi, score_grid_arr, self.config)
 
+            robot_prior_score = 0.0
+            robot_dist = None
+            robot_prox = None
+            robot_prior_valid = False
+            if bool(getattr(self.config, "final_robot_prior_enabled", False)):
+                robot_feats = _compute_roi_robot_distance_features(
+                    roi,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    gripper_core_grid_mask=gripper_core_grid_mask,
+                    gripper_guard_grid_mask=gripper_guard_grid_mask,
+                    arm_core_grid_mask=arm_core_grid_mask,
+                    arm_guard_grid_mask=arm_guard_grid_mask,
+                    sigma=float(getattr(self.config, "final_robot_sigma", 0.35)),
+                    use_core=bool(getattr(self.config, "final_robot_prior_use_core", True)),
+                    use_guard=bool(getattr(self.config, "final_robot_prior_use_guard", True)),
+                )
+                robot_dist = float(robot_feats["robot_dist"])
+                robot_prox = float(robot_feats["robot_prox"])
+                robot_prior_valid = bool(robot_feats["robot_prior_valid"])
+                if robot_prior_valid:
+                    robot_prior_score = (
+                        float(getattr(self.config, "final_w_robot_dist", 0.0)) * robot_dist
+                        - float(getattr(self.config, "final_w_robot_prox_penalty", 0.0)) * robot_prox
+                    )
+
+            final_score = evidence.get("final_score") if use_final_score else None
+            if final_score is not None:
+                final_score = float(final_score) + float(robot_prior_score)
+
             candidate_strength = (
                 float(evidence["mass"])
                 if use_final_score and evidence.get("mass") is not None
@@ -467,12 +589,17 @@ class PatchSelector:
             candidate = {
                 "roi": roi,
                 "raw_score": float(raw_score),
-                "final_score": evidence.get("final_score") if use_final_score else None,
+                "final_score": final_score,
                 "evidence_score": evidence.get("evidence_score") if use_final_score else None,
                 "env_prior_score": evidence.get("env_prior_score") if use_final_score else None,
                 "center_dist": evidence.get("center_dist") if use_final_score else None,
                 "center_prox": evidence.get("center_prox") if use_final_score else None,
                 "final_env_prior_enabled": bool(evidence.get("final_env_prior_enabled", False)) if use_final_score else False,
+                "robot_prior_score": float(robot_prior_score),
+                "robot_dist": robot_dist,
+                "robot_prox": robot_prox,
+                "robot_prior_valid": bool(robot_prior_valid),
+                "final_robot_prior_enabled": bool(getattr(self.config, "final_robot_prior_enabled", False)),
                 "evidence_mass": evidence.get("mass") if use_final_score else None,
                 "density": evidence.get("density") if use_final_score else None,
                 "peak": evidence.get("peak") if use_final_score else None,
@@ -527,6 +654,11 @@ class PatchSelector:
                     "center_dist": candidate.get("center_dist"),
                     "center_prox": candidate.get("center_prox"),
                     "final_env_prior_enabled": bool(candidate.get("final_env_prior_enabled", False)),
+                    "robot_prior_score": candidate.get("robot_prior_score"),
+                    "robot_dist": candidate.get("robot_dist"),
+                    "robot_prox": candidate.get("robot_prox"),
+                    "robot_prior_valid": bool(candidate.get("robot_prior_valid", False)),
+                    "final_robot_prior_enabled": bool(candidate.get("final_robot_prior_enabled", False)),
                     "evidence_mass": candidate.get("evidence_mass"),
                     "density": candidate.get("density"),
                     "peak": candidate.get("peak"),

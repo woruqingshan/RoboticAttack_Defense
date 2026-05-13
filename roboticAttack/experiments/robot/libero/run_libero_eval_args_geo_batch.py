@@ -796,6 +796,12 @@ def eval_libero(cfg) -> None:
                     final_w_dist=float(getattr(cfg, "defense_final_w_dist", 0.0)),
                     final_w_center_penalty=float(getattr(cfg, "defense_final_w_center_penalty", 0.0)),
                     final_center_sigma=float(getattr(cfg, "defense_final_center_sigma", 0.35)),
+                    final_robot_prior_enabled=bool(getattr(cfg, "defense_final_robot_prior_enabled", False)),
+                    final_w_robot_dist=float(getattr(cfg, "defense_final_w_robot_dist", 0.0)),
+                    final_w_robot_prox_penalty=float(getattr(cfg, "defense_final_w_robot_prox_penalty", 0.0)),
+                    final_robot_sigma=float(getattr(cfg, "defense_final_robot_sigma", 0.35)),
+                    final_robot_prior_use_guard=bool(getattr(cfg, "defense_final_robot_prior_use_guard", True)),
+                    final_robot_prior_use_core=bool(getattr(cfg, "defense_final_robot_prior_use_core", True)),
                 )
                 patch_selector = PatchSelector(ps_cfg)
 
@@ -1555,6 +1561,12 @@ def parse_args():
     parser.add_argument("--defense_final_w_dist", type=float, default=0.0, help="Weight for normalized distance from grid center in PatchSelector final re-ranking.")
     parser.add_argument("--defense_final_w_center_penalty", type=float, default=0.0, help="Penalty weight for center proximity in PatchSelector final re-ranking.")
     parser.add_argument("--defense_final_center_sigma", type=float, default=0.35, help="Center proximity sigma for PatchSelector final environmental prior.")
+    parser.add_argument("--defense_final_robot_prior_enabled", type=str2bool, default=False, help="Enable soft robot-distance prior only for PatchSelector final re-ranking.")
+    parser.add_argument("--defense_final_w_robot_dist", type=float, default=0.0, help="Weight for normalized distance from robot geometry in PatchSelector final re-ranking.")
+    parser.add_argument("--defense_final_w_robot_prox_penalty", type=float, default=0.0, help="Penalty weight for robot proximity in PatchSelector final re-ranking.")
+    parser.add_argument("--defense_final_robot_sigma", type=float, default=0.35, help="Robot proximity sigma for PatchSelector final robot-distance prior.")
+    parser.add_argument("--defense_final_robot_prior_use_guard", type=str2bool, default=True, help="Include guard geometry masks in PatchSelector robot-distance prior.")
+    parser.add_argument("--defense_final_robot_prior_use_core", type=str2bool, default=True, help="Include core geometry masks in PatchSelector robot-distance prior.")
     parser.add_argument("--defense_localizer_top_k", type=int, default=3, help="Requested localizer Top-K count when the active localizer constructor supports it.")
     parser.add_argument("--defense_tau_protect", type=float, default=0.1, help="Max allowed overlap ratio of mask with GripperPrior.")
     parser.add_argument("--defense_tau_cover", type=float, default=0.5, help="Min required coverage ratio of the initial mask.")
