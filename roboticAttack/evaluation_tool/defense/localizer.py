@@ -356,10 +356,13 @@ class TemporalPatchAttentionLocalizer:
     w_mass: float = 1.2
     w_peak: float = 0.3
     w_density: float = 0.2
-    w_dist: float = 0.6
+    w_dist: float = 0.0
     w_area_penalty: float = 0.5
-    w_center_penalty: float = 0.6
-    w_mainland_iou_penalty: float = 1.0
+    w_shape_penalty: float = 0.2
+    w_center_penalty: float = 0.0
+    w_mainland_iou_penalty: float = 0.0
+    use_spatial_prior: bool = False
+    exclude_mainland: bool = False
     center_sigma: float = 0.35  # normalized by diag
     
     # Top-K candidates for parallel PRAC evaluation
@@ -437,13 +440,17 @@ class TemporalPatchAttentionLocalizer:
         candidates: List[Tuple[float, ComponentStats, Dict[str, float]]] = []
 
         for c in fc.components:
-            if mainland is not None and c.label == mainland.label:
+            if bool(self.exclude_mainland) and mainland is not None and c.label == mainland.label:
                 continue
 
             m = float(c.roi_mass)
             p = float(c.peak / peak_global)
             dens = float(c.density)
             area = float(c.area_ratio)
+            width = float(max(0, int(c.roi.gx1) - int(c.roi.gx0)))
+            height = float(max(0, int(c.roi.gy1) - int(c.roi.gy0)))
+            aspect = width / max(height, float(self.eps))
+            shape_penalty = float(abs(np.log(aspect + float(self.eps))))
 
             dx = float(c.centroid[0] - cx0)
             dy = float(c.centroid[1] - cy0)
@@ -458,11 +465,15 @@ class TemporalPatchAttentionLocalizer:
                 float(self.w_mass) * m
                 + float(self.w_peak) * p
                 + float(self.w_density) * (dens / (dens + 1.0))
-                + float(self.w_dist) * dist
                 - float(self.w_area_penalty) * np.sqrt(max(0.0, area))
-                - float(self.w_center_penalty) * center_prox
-                - float(self.w_mainland_iou_penalty) * mainland_iou
+                - float(self.w_shape_penalty) * shape_penalty
             )
+            if bool(self.use_spatial_prior):
+                score += (
+                    float(self.w_dist) * dist
+                    - float(self.w_center_penalty) * center_prox
+                    - float(self.w_mainland_iou_penalty) * mainland_iou
+                )
 
             iou_prev = float(grid_iou(c.roi, self._last_roi)) if self._last_roi is not None else 0.0
             if iou_prev >= float(self.assoc_iou_thr):
@@ -473,9 +484,13 @@ class TemporalPatchAttentionLocalizer:
                 "p": p,
                 "dens": dens,
                 "area": area,
+                "aspect": aspect,
+                "shape_penalty": shape_penalty,
                 "dist": dist,
                 "center_prox": center_prox,
                 "mainland_iou": mainland_iou,
+                "use_spatial_prior": bool(self.use_spatial_prior),
+                "exclude_mainland": bool(self.exclude_mainland),
                 "iou_prev": iou_prev,
             }
             candidates.append((float(score), c, feats))
@@ -488,8 +503,12 @@ class TemporalPatchAttentionLocalizer:
                 threshold=float(fc.threshold),
                 chosen_label=None,
                 main_label=main_label,
-                reason="no_islands_excluding_mainland",
-                debug={"main_label": main_label},
+                reason="no_components_after_filter",
+                debug={
+                    "main_label": main_label,
+                    "use_spatial_prior": bool(self.use_spatial_prior),
+                    "exclude_mainland": bool(self.exclude_mainland),
+                },
                 top_k_candidates=[],
             )
 
@@ -548,6 +567,8 @@ class TemporalPatchAttentionLocalizer:
                 **best_feats,
             },
             "main": {"label": int(main_label) if main_label is not None else None},
+            "use_spatial_prior": bool(self.use_spatial_prior),
+            "exclude_mainland": bool(self.exclude_mainland),
             "top3": [
                 {
                     "label": int(c.label),
@@ -579,4 +600,3 @@ class TemporalPatchAttentionLocalizer:
             debug=debug,
             top_k_candidates=top_k_candidates,
         )
-

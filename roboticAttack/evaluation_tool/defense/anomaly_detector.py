@@ -725,6 +725,7 @@ class OnlinePatchDefenseController:
                     arm_region_grid=arm_region_grid,
                     arm_core_grid_mask=arm_core_grid_mask,
                     arm_guard_grid_mask=arm_guard_grid_mask,
+                    score_grid=stable_grid,
                 )
                 patch_verdict_str = ps_res.verdict
                 best_roi = ps_res.roi
