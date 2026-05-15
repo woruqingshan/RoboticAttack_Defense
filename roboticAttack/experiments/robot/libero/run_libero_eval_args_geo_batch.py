@@ -20,6 +20,8 @@ Usage:
 
 import os
 import sys
+import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -187,6 +189,173 @@ def _format_zres_debug_line(step: int, zres_debug) -> str:
         f"candidate_max={_fmt(zres_debug.get('candidate_grid_max'))} "
         f"retained_ratio={_fmt(zres_debug.get('residual_retained_ratio'))}"
     )
+
+
+def _runtime_json_safe(value):
+    """Convert numpy scalars and containers into JSON-safe values."""
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        val = float(value)
+        return val if np.isfinite(val) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _runtime_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_runtime_json_safe(v) for v in value]
+    return value
+
+
+class RuntimeMeter:
+    """Low-overhead deployment runtime logger for policy-side timing."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        jsonl_path: str,
+        summary_path: str,
+        warmup_steps: int = 10,
+        save_jsonl: bool = True,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.jsonl_path = jsonl_path
+        self.summary_path = summary_path
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.save_jsonl = bool(save_jsonl)
+        self.rows: List[Dict[str, Any]] = []
+        self._step_count = 0
+        self._fh = None
+        if self.enabled and self.save_jsonl:
+            os.makedirs(os.path.dirname(os.path.abspath(self.jsonl_path)), exist_ok=True)
+            self._fh = open(self.jsonl_path, "w")
+
+    def _sync_cuda(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    def start(self):
+        if not self.enabled:
+            return None
+        self._sync_cuda()
+        return time.perf_counter()
+
+    def stop_ms(self, start_time) -> Optional[float]:
+        if not self.enabled or start_time is None:
+            return None
+        self._sync_cuda()
+        return float((time.perf_counter() - start_time) * 1000.0)
+
+    @staticmethod
+    def _finite_values(rows: List[Dict[str, Any]], key: str) -> List[float]:
+        vals = []
+        for row in rows:
+            val = row.get(key)
+            if isinstance(val, (int, float, np.integer, np.floating)) and np.isfinite(float(val)):
+                vals.append(float(val))
+        return vals
+
+    @staticmethod
+    def _mean(vals: List[float]) -> Optional[float]:
+        return float(np.mean(vals)) if vals else None
+
+    @staticmethod
+    def _median(vals: List[float]) -> Optional[float]:
+        return float(np.median(vals)) if vals else None
+
+    @staticmethod
+    def _p95(vals: List[float]) -> Optional[float]:
+        return float(np.percentile(vals, 95)) if vals else None
+
+    def write_step(self, row: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        row = dict(row)
+        row["warmup_excluded"] = bool(self._step_count < self.warmup_steps)
+        row = _runtime_json_safe(row)
+        self.rows.append(row)
+        self._step_count += 1
+        if self._fh is not None:
+            try:
+                self._fh.write(json.dumps(row, sort_keys=True) + "\n")
+                self._fh.flush()
+            except Exception:
+                self.close()
+
+    def write_summary(self) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        measured = [row for row in self.rows if not bool(row.get("warmup_excluded", False))]
+        masked = [row for row in measured if bool(row.get("mask_triggered", row.get("should_purify", False)))]
+        unmasked = [row for row in measured if not bool(row.get("mask_triggered", row.get("should_purify", False)))]
+
+        first_vals = self._finite_values(measured, "first_policy_forward_ms")
+        deployment_vals = self._finite_values(measured, "deployment_total_ms")
+        first_mean = self._mean(first_vals)
+        deployment_mean = self._mean(deployment_vals)
+        overhead_ratio = None
+        if first_mean is not None and first_mean > 1e-9 and deployment_mean is not None:
+            overhead_ratio = float(deployment_mean / first_mean)
+
+        summary = {
+            "record_type": "runtime_summary",
+            "num_runtime_steps": int(len(self.rows)),
+            "num_measured_steps_after_warmup": int(len(measured)),
+            "mask_rate": float(len(masked) / len(measured)) if measured else None,
+            "mean_first_policy_forward_ms": first_mean,
+            "median_first_policy_forward_ms": self._median(first_vals),
+            "p95_first_policy_forward_ms": self._p95(first_vals),
+            "mean_defense_controller_ms": self._mean(self._finite_values(measured, "defense_controller_ms")),
+            "mean_purification_ms": self._mean(self._finite_values(measured, "purification_ms")),
+            "mean_second_policy_forward_ms": self._mean(self._finite_values(measured, "second_policy_forward_ms")),
+            "mean_deployment_total_ms": deployment_mean,
+            "median_deployment_total_ms": self._median(deployment_vals),
+            "p95_deployment_total_ms": self._p95(deployment_vals),
+            "mean_masked_step_total_ms": self._mean(self._finite_values(masked, "deployment_total_ms")),
+            "mean_unmasked_step_total_ms": self._mean(self._finite_values(unmasked, "deployment_total_ms")),
+            "overhead_ratio_vs_first_forward_mean": overhead_ratio,
+            "note": "Diagnostic metric forwards, JSON logging, visualization, video saving, and env stepping are excluded from deployment_total_ms.",
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(self.summary_path)), exist_ok=True)
+        with open(self.summary_path, "w") as fh:
+            json.dump(_runtime_json_safe(summary), fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        return summary
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _runtime_component(value: Optional[float]) -> float:
+    """Return a finite runtime component, using zero for components not executed."""
+    if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(float(value)):
+        return float(value)
+    return 0.0
+
+
+def _runtime_mask_area_ratio(defense_result, dlog: Dict[str, Any], image_hw) -> Optional[float]:
+    """Estimate selected mask area ratio for runtime rows when available."""
+    h, w = int(image_hw[0]), int(image_hw[1])
+    denom = float(max(1, h * w))
+    roi_mask = getattr(defense_result, "roi_mask", None) if defense_result is not None else None
+    if isinstance(roi_mask, np.ndarray) and roi_mask.ndim == 2:
+        return float(np.asarray(roi_mask).astype(bool).sum() / denom)
+    roi_box = dlog.get("roi_box") if isinstance(dlog, dict) else None
+    box = _box_dict_to_list(roi_box)
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    return float(max(0, x1 - x0) * max(0, y1 - y0) / denom)
 
 
 def _normalize_heatmap_uint8(heatmap) -> "np.ndarray":
@@ -901,6 +1070,17 @@ def eval_libero(cfg) -> None:
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
     print(f"Log Path:{str(os.path.join(cfg.local_log_dir, cfg.task_suite_name, '.txt'))}")
+    runtime_meter = RuntimeMeter(
+        enabled=bool(getattr(cfg, "runtime_metrics_enabled", False)),
+        jsonl_path=os.path.join(cfg.local_log_dir, str(getattr(cfg, "runtime_jsonl_name", "runtime_metrics.jsonl"))),
+        summary_path=os.path.join(cfg.local_log_dir, str(getattr(cfg, "runtime_summary_name", "runtime_summary.json"))),
+        warmup_steps=int(getattr(cfg, "runtime_warmup_steps", 10)),
+        save_jsonl=bool(getattr(cfg, "runtime_save_jsonl", True)),
+    )
+    if runtime_meter.enabled:
+        log_file.write(f"[RUNTIME] Writing runtime metrics to {runtime_meter.jsonl_path}\n")
+        log_file.write(f"[RUNTIME] Summary will be written to {runtime_meter.summary_path}\n")
+        log_file.flush()
     # Initialize Weights & Biases logging as well
     if cfg.use_wandb:
         wandb.init(
@@ -1042,6 +1222,12 @@ def eval_libero(cfg) -> None:
                             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                         ),
                     }
+                    first_policy_forward_ms = None
+                    defense_controller_ms = 0.0
+                    purification_ms = 0.0
+                    second_policy_forward_ms = 0.0
+                    metric_clean_forward_ms = None
+                    env_step_ms = None
 
                     # Query model to get action (this forward pass is also used to populate attention hooks)
                     if defense_hook is not None:
@@ -1054,7 +1240,9 @@ def eval_libero(cfg) -> None:
                             log_file.write(error_msg + "\n")
                             log_file.close()
                             sys.exit(1)
+                    _runtime_start = runtime_meter.start()
                     action = get_action(cfg, model, observation, task_description, processor=processor)
+                    first_policy_forward_ms = runtime_meter.stop_ms(_runtime_start)
                     action_adv_raw_for_metric = _copy_action_for_metrics(action)
                     action_def_raw_for_metric = action_adv_raw_for_metric
                     action_clean_raw_for_metric = None
@@ -1097,6 +1285,7 @@ def eval_libero(cfg) -> None:
                                 )
 
                             # For auto mode, pass additional parameters
+                            _runtime_start = runtime_meter.start()
                             if defense_mode == "auto":
                                 defense_result = defense_interface.step(
                                     image=img,
@@ -1112,6 +1301,7 @@ def eval_libero(cfg) -> None:
                                 )
                             else:
                                 defense_result = defense_interface.step(eef_pos=eef_pos, geometry_ctx=geometry_ctx)
+                            defense_controller_ms = _runtime_component(runtime_meter.stop_ms(_runtime_start))
                         except Exception as defense_error:
                             # Exit immediately on defense errors to avoid empty episode analysis
                             error_msg = f"FATAL DEFENSE ERROR: {defense_error}"
@@ -1173,6 +1363,7 @@ def eval_libero(cfg) -> None:
                             
                             # Purify image (unified interface)
                             # Use strength from defense_result if available (auto mode provides dynamic strength)
+                            _runtime_start = runtime_meter.start()
                             if isinstance(roi_mask, np.ndarray):
                                 img_for_policy = defense_purifier.purify_with_mask(
                                     img_for_policy,
@@ -1185,6 +1376,7 @@ def eval_libero(cfg) -> None:
                                     defense_result.roi_box,
                                     strength=getattr(defense_result, "strength", None),  # Use dynamic strength if available
                                 )
+                            purification_ms = _runtime_component(runtime_meter.stop_ms(_runtime_start))
                             
                             # Recompute action on purified image
                             observation["full_image"] = img_for_policy
@@ -1192,7 +1384,9 @@ def eval_libero(cfg) -> None:
                             if getattr(cfg, "defense_recompute_action", True):
                                 if defense_hook is not None:
                                     defense_hook.clear()
+                                _runtime_start = runtime_meter.start()
                                 action = get_action(cfg, model, observation, task_description, processor=processor)
+                                second_policy_forward_ms = _runtime_component(runtime_meter.stop_ms(_runtime_start))
                                 action_def_raw_for_metric = _copy_action_for_metrics(action)
                                 hm_def_for_metric = _copy_heatmap_from_hook(defense_hook)
                             
@@ -1212,6 +1406,7 @@ def eval_libero(cfg) -> None:
                                 defense_hook.clear()
                             except Exception:
                                 pass
+                        _runtime_start = runtime_meter.start()
                         clean_action_tmp = get_action(
                             cfg,
                             model,
@@ -1219,6 +1414,7 @@ def eval_libero(cfg) -> None:
                             task_description,
                             processor=processor,
                         )
+                        metric_clean_forward_ms = runtime_meter.stop_ms(_runtime_start)
                         action_clean_raw_for_metric = _copy_action_for_metrics(clean_action_tmp)
                         hm_clean_for_metric = _copy_heatmap_from_hook(defense_hook)
 
@@ -1274,7 +1470,40 @@ def eval_libero(cfg) -> None:
                         action = invert_gripper_action(action)
 
                     # Execute action in environment
+                    _runtime_start = runtime_meter.start()
                     obs, reward, done, info = env.step(action.tolist())
+                    env_step_ms = runtime_meter.stop_ms(_runtime_start)
+                    deployment_total_ms = (
+                        _runtime_component(first_policy_forward_ms)
+                        + _runtime_component(defense_controller_ms)
+                        + _runtime_component(purification_ms)
+                        + _runtime_component(second_policy_forward_ms)
+                    )
+                    runtime_meter.write_step(
+                        {
+                            "record_type": "runtime_step",
+                            "task_suite_name": str(getattr(cfg, "task_suite_name", "")),
+                            "task_id": int(task_id),
+                            "episode_idx": int(episode_idx),
+                            "step_idx": int(t),
+                            "run_id_note": getattr(cfg, "run_id_note", None),
+                            "cudaid": getattr(cfg, "cudaid", None),
+                            "defense_enabled": bool(getattr(cfg, "defense_enabled", False)),
+                            "defense_mode": str(defense_mode),
+                            "use_patch": bool(getattr(cfg, "use_patch", False)),
+                            "should_purify": bool(dlog.get("should_purify")) if isinstance(dlog, dict) else False,
+                            "mask_triggered": bool(defense_result is not None and getattr(defense_result, "should_purify", False)),
+                            "mask_area_ratio": _runtime_mask_area_ratio(defense_result, dlog, img_for_policy.shape[:2]),
+                            "first_policy_forward_ms": first_policy_forward_ms,
+                            "defense_controller_ms": defense_controller_ms,
+                            "purification_ms": purification_ms,
+                            "second_policy_forward_ms": second_policy_forward_ms,
+                            "deployment_total_ms": deployment_total_ms,
+                            "metric_clean_forward_ms": metric_clean_forward_ms,
+                            "metric_clean_forward_diagnostic_only": metric_clean_forward_ms is not None,
+                            "env_step_ms": env_step_ms,
+                        }
+                    )
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -1359,6 +1588,18 @@ def eval_libero(cfg) -> None:
                     f"num_episodes/{task_description}": task_episodes,
                 }
             )
+
+    runtime_summary = runtime_meter.write_summary()
+    if runtime_summary is not None:
+        log_file.write(f"[RUNTIME] Summary written to {runtime_meter.summary_path}\n")
+        log_file.write(
+            "[RUNTIME] "
+            f"steps={runtime_summary.get('num_measured_steps_after_warmup')} "
+            f"mean_deployment_total_ms={runtime_summary.get('mean_deployment_total_ms')} "
+            f"overhead_ratio={runtime_summary.get('overhead_ratio_vs_first_forward_mean')}\n"
+        )
+        log_file.flush()
+    runtime_meter.close()
 
     # Save local log file
     log_file.close()
@@ -1624,6 +1865,16 @@ def parse_args():
     parser.add_argument("--metrics_patch_w", type=int, default=50, help="Fallback patch width for ground-truth patch mask.")
     parser.add_argument("--metrics_patch_h", type=int, default=50, help="Fallback patch height for ground-truth patch mask.")
     parser.add_argument("--metrics_top_quantile", type=float, default=0.90, help="Attention quantile for Top-K attention IoU with patch.")
+
+    # Runtime overhead logging. Deployment totals exclude env stepping,
+    # visualization, JSON writing, video saving, and diagnostic clean forwards.
+    # Example no-defense baseline: --defense_enabled False --runtime_metrics_enabled True
+    # Example E-GCAR run: --defense_enabled True --runtime_metrics_enabled True
+    parser.add_argument("--runtime_metrics_enabled", type=str2bool, default=False, help="Enable deployment runtime overhead logging.")
+    parser.add_argument("--runtime_warmup_steps", type=int, default=10, help="Number of policy-control steps excluded from runtime summary.")
+    parser.add_argument("--runtime_save_jsonl", type=str2bool, default=True, help="Write per-step runtime metrics JSONL under local_log_dir.")
+    parser.add_argument("--runtime_jsonl_name", type=str, default="runtime_metrics.jsonl", help="Runtime JSONL filename under local_log_dir.")
+    parser.add_argument("--runtime_summary_name", type=str, default="runtime_summary.json", help="Runtime summary JSON filename under local_log_dir.")
 
     # PRAC checker parameters
     parser.add_argument("--defense_prac_enabled", type=str2bool, default=False, help="Enable PRAC (Patch-wise Randomized Attention Consistency) checker (auto mode only).")
