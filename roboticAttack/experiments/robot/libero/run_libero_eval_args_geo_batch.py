@@ -358,6 +358,51 @@ def _runtime_mask_area_ratio(defense_result, dlog: Dict[str, Any], image_hw) -> 
     return float(max(0, x1 - x0) * max(0, y1 - y0) / denom)
 
 
+def _apply_cv_input_baseline(image_rgb: np.ndarray, cfg) -> np.ndarray:
+    """Apply a simple global CV input-side baseline to the policy image."""
+    strategy = str(getattr(cfg, "cv_baseline_strategy", "none")).lower()
+    if strategy in ("none", ""):
+        return image_rgb
+
+    img = np.asarray(image_rgb)
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+
+    if strategy == "jpeg":
+        try:
+            import cv2
+            quality = int(getattr(cfg, "cv_jpeg_quality", 50))
+            quality = max(1, min(100, quality))
+            bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if not ok:
+                print("[CV_BASELINE][WARN] JPEG encode failed; using original image.")
+                return img
+            dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+            if dec is None:
+                print("[CV_BASELINE][WARN] JPEG decode failed; using original image.")
+                return img
+            return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
+        except Exception as exc:
+            print(f"[CV_BASELINE][WARN] JPEG baseline unavailable ({exc}); using original image.")
+            return img
+
+    if strategy == "gaussian_blur":
+        try:
+            import cv2
+            k = int(getattr(cfg, "cv_blur_ksize", 5))
+            if k % 2 == 0:
+                k += 1
+            k = max(3, k)
+            sigma = float(getattr(cfg, "cv_blur_sigma", 1.0))
+            return cv2.GaussianBlur(img, (k, k), sigmaX=sigma, sigmaY=sigma)
+        except Exception as exc:
+            print(f"[CV_BASELINE][WARN] Gaussian blur baseline unavailable ({exc}); using original image.")
+            return img
+
+    raise ValueError(f"Unsupported cv_baseline_strategy: {strategy}")
+
+
 def _normalize_heatmap_uint8(heatmap) -> "np.ndarray":
     """Normalize a float heatmap into uint8 [0,255] for visualization."""
     hm = heatmap.astype(np.float32)
@@ -1081,6 +1126,16 @@ def eval_libero(cfg) -> None:
         log_file.write(f"[RUNTIME] Writing runtime metrics to {runtime_meter.jsonl_path}\n")
         log_file.write(f"[RUNTIME] Summary will be written to {runtime_meter.summary_path}\n")
         log_file.flush()
+    cv_baseline_line = (
+        f"[CV_BASELINE] enabled={bool(getattr(cfg, 'cv_baseline_enabled', False))} "
+        f"strategy={str(getattr(cfg, 'cv_baseline_strategy', 'none'))} "
+        f"jpeg_quality={int(getattr(cfg, 'cv_jpeg_quality', 50))} "
+        f"blur_ksize={int(getattr(cfg, 'cv_blur_ksize', 5))} "
+        f"blur_sigma={float(getattr(cfg, 'cv_blur_sigma', 1.0))}"
+    )
+    print(cv_baseline_line)
+    log_file.write(cv_baseline_line + "\n")
+    log_file.flush()
     # Initialize Weights & Biases logging as well
     if cfg.use_wandb:
         wandb.init(
@@ -1207,6 +1262,8 @@ def eval_libero(cfg) -> None:
                             img, patch, geometry=True, colorjitter=False,
                             angle=cfg.angle, shx=cfg.shx, shy=cfg.shy, position=(cfg.x, cfg.y)
                         )
+                    if getattr(cfg, "cv_baseline_enabled", False):
+                        img = _apply_cv_input_baseline(img, cfg)
                     img_adv_for_metric = img.copy()
                     img_def_for_metric = img_adv_for_metric
                     img_for_policy = img
@@ -1706,6 +1763,20 @@ def parse_args():
     parser.add_argument("--shx", type=float, default=0, help="")
     parser.add_argument("--shy", type=float, default=0, help="")
     parser.add_argument("--cudaid", type=int, default=2, help="")
+
+    # Simple global CV input-side baselines. These are reviewer baselines,
+    # not part of GEAR, and are applied after patch insertion.
+    parser.add_argument("--cv_baseline_enabled", type=str2bool, default=False, help="Enable a global CV input-side baseline before policy inference.")
+    parser.add_argument(
+        "--cv_baseline_strategy",
+        type=str,
+        default="none",
+        choices=["none", "jpeg", "gaussian_blur"],
+        help="Global CV baseline strategy: none, jpeg, or gaussian_blur.",
+    )
+    parser.add_argument("--cv_jpeg_quality", type=int, default=50, help="JPEG quality for the jpeg CV baseline.")
+    parser.add_argument("--cv_blur_ksize", type=int, default=5, help="Kernel size for the Gaussian blur CV baseline.")
+    parser.add_argument("--cv_blur_sigma", type=float, default=1.0, help="Gaussian sigma for the Gaussian blur CV baseline.")
 
     # Defense control (online, debug stage)
     parser.add_argument("--defense_enabled", type=str2bool, default=False, help="Enable online attention-based defense.")
