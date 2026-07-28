@@ -163,6 +163,20 @@ def _defense_debug_geometry(cfg) -> bool:
     """Return True when verbose geometry debug logs are enabled."""
     return bool(getattr(cfg, "defense_debug", False) and getattr(cfg, "defense_debug_geometry", False))
 
+def _env_progress_debug_enabled(cfg) -> bool:
+    """Return True when environment progress debug logs are enabled."""
+    return bool(getattr(cfg, "env_progress_debug", False))
+
+
+def _env_progress_log(cfg, log_file, msg: str) -> None:
+    """Print and flush environment progress logs for hang diagnosis."""
+    if not _env_progress_debug_enabled(cfg):
+        return
+    line = f"[ENV_DEBUG] {time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    print(line, flush=True)
+    if log_file is not None:
+        log_file.write(line + "\n")
+        log_file.flush()
 
 def _format_zres_debug_line(step: int, zres_debug) -> str:
     """Format geometry residual attention debug fields."""
@@ -1148,9 +1162,17 @@ def eval_libero(cfg) -> None:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
-    print(f"Task suite: {cfg.task_suite_name}")
+    print(f"Task suite: {cfg.task_suite_name}", flush=True)
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
-    log_file.write(f"Log Path:{str(os.path.join(cfg.local_log_dir, cfg.task_suite_name, '.txt'))}")
+    log_file.write(f"Log Path:{str(os.path.join(cfg.local_log_dir, cfg.task_suite_name, '.txt'))}\n")
+    log_file.flush()
+
+    _env_progress_log(
+        cfg,
+        log_file,
+        f"task_suite_ready suite={cfg.task_suite_name} num_tasks={num_tasks_in_suite} "
+        f"single_task_id={getattr(cfg, 'single_task_id', None)}"
+    )
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
@@ -1168,14 +1190,34 @@ def eval_libero(cfg) -> None:
         task_acquire_count = 0
         task_reacquire_count = 0
 
+        _env_progress_log(cfg, log_file, f"task_id={task_id}: selected")
+
         # Get task
+        _env_progress_log(cfg, log_file, f"task_id={task_id}: get_task start")
         task = task_suite.get_task(task_id)
+        _env_progress_log(cfg, log_file, f"task_id={task_id}: get_task done")
 
         # Get default LIBERO initial states
+        _env_progress_log(cfg, log_file, f"task_id={task_id}: get_init_states start")
         initial_states = task_suite.get_task_init_states(task_id)
+        try:
+            init_state_count = len(initial_states)
+        except Exception:
+            init_state_count = "unknown"
+        _env_progress_log(
+            cfg,
+            log_file,
+            f"task_id={task_id}: get_init_states done count={init_state_count}"
+        )
 
         # Initialize LIBERO environment and task description
+        _env_progress_log(cfg, log_file, f"task_id={task_id}: get_libero_env start")
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+        _env_progress_log(
+            cfg,
+            log_file,
+            f"task_id={task_id}: get_libero_env done task='{task_description.strip()}'"
+        )
         _defense_debug_print(
             cfg,
             f"[DEFENSE][TASK_START] task_id={task_id} task='{task_description.strip()}' "
@@ -1205,7 +1247,17 @@ def eval_libero(cfg) -> None:
             log_file.write(f"\nTask: {task_description}\n")
 
             # Reset environment
+            _env_progress_log(
+                cfg,
+                log_file,
+                f"task_id={task_id} episode={episode_idx + 1}: env.reset start"
+            )
             env.reset()
+            _env_progress_log(
+                cfg,
+                log_file,
+                f"task_id={task_id} episode={episode_idx + 1}: env.reset done"
+            )
             
             # Reset defense stateful components for new episode
             if defense_interface is not None:
@@ -1219,8 +1271,19 @@ def eval_libero(cfg) -> None:
                     log_file.close()
                     sys.exit(1)
 
+            
             # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx]) #
+            _env_progress_log(
+                cfg,
+                log_file,
+                f"task_id={task_id} episode={episode_idx + 1}: set_init_state start"
+            )
+            obs = env.set_init_state(initial_states[episode_idx])
+            _env_progress_log(
+                cfg,
+                log_file,
+                f"task_id={task_id} episode={episode_idx + 1}: set_init_state done"
+            )
 
             # Setup
             t = 0
@@ -1251,6 +1314,14 @@ def eval_libero(cfg) -> None:
                         obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
                         t += 1
                         continue
+                    
+                    first_control_step_debug = bool(_env_progress_debug_enabled(cfg) and t == cfg.num_steps_wait)
+                    if first_control_step_debug:
+                        _env_progress_log(
+                            cfg,
+                            log_file,
+                            f"task_id={task_id} episode={episode_idx + 1}: first control step start t={t}"
+                        )
 
                     # Get preprocessed image. Metrics keep clean / adversarial / defended
                     # copies as evidence only; the executed action path below is unchanged.
@@ -1297,9 +1368,23 @@ def eval_libero(cfg) -> None:
                             log_file.write(error_msg + "\n")
                             log_file.close()
                             sys.exit(1)
+                    if first_control_step_debug:
+                        _env_progress_log(
+                            cfg,
+                            log_file,
+                            f"task_id={task_id} episode={episode_idx + 1}: first get_action start"
+                        )
+
                     _runtime_start = runtime_meter.start()
                     action = get_action(cfg, model, observation, task_description, processor=processor)
                     first_policy_forward_ms = runtime_meter.stop_ms(_runtime_start)
+
+                    if first_control_step_debug:
+                        _env_progress_log(
+                            cfg,
+                            log_file,
+                            f"task_id={task_id} episode={episode_idx + 1}: first get_action done"
+                        )
                     action_adv_raw_for_metric = _copy_action_for_metrics(action)
                     action_def_raw_for_metric = action_adv_raw_for_metric
                     action_clean_raw_for_metric = None
@@ -1942,6 +2027,7 @@ def parse_args():
     # Example no-defense baseline: --defense_enabled False --runtime_metrics_enabled True
     # Example E-GCAR run: --defense_enabled True --runtime_metrics_enabled True
     parser.add_argument("--runtime_metrics_enabled", type=str2bool, default=False, help="Enable deployment runtime overhead logging.")
+    parser.add_argument("--env_progress_debug", type=str2bool, default=False, help="Enable flushed environment progress logs for diagnosing LIBERO/MuJoCo hangs.",)
     parser.add_argument("--runtime_warmup_steps", type=int, default=10, help="Number of policy-control steps excluded from runtime summary.")
     parser.add_argument("--runtime_save_jsonl", type=str2bool, default=True, help="Write per-step runtime metrics JSONL under local_log_dir.")
     parser.add_argument("--runtime_jsonl_name", type=str, default="runtime_metrics.jsonl", help="Runtime JSONL filename under local_log_dir.")

@@ -2,6 +2,7 @@
 
 import math
 import os
+import time
 
 import imageio
 import numpy as np
@@ -20,13 +21,70 @@ from experiments.robot.robot_utils import (
 )
 
 
+def _libero_env_debug_enabled() -> bool:
+    """Return True when LIBERO environment initialization debug logs are enabled."""
+    return os.environ.get("LIBERO_ENV_DEBUG", "0").lower() in ("1", "true", "yes", "y")
+
+
+def _libero_env_debug_log(msg: str) -> None:
+    """Print flushed LIBERO environment initialization logs."""
+    if not _libero_env_debug_enabled():
+        return
+    line = f"[LIBERO_ENV] {time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    print(line, flush=True)
+
+
 def get_libero_env(task, model_family, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
-    task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+
+    _libero_env_debug_log("get_libero_env entered")
+    _libero_env_debug_log(f"model_family={model_family}")
+    _libero_env_debug_log(f"resolution={resolution}")
+    _libero_env_debug_log(f"task_language={task_description}")
+
+    _libero_env_debug_log(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    _libero_env_debug_log(f"CUDA_DEVICE_ORDER={os.environ.get('CUDA_DEVICE_ORDER')}")
+    _libero_env_debug_log(f"MUJOCO_GL={os.environ.get('MUJOCO_GL')}")
+    _libero_env_debug_log(f"MUJOCO_EGL_DEVICE_ID={os.environ.get('MUJOCO_EGL_DEVICE_ID')}")
+    _libero_env_debug_log(f"LIBERO_DATASET_PATH={os.environ.get('LIBERO_DATASET_PATH')}")
+    _libero_env_debug_log(f"ROBOTIC_ATTACK_MODEL_ROOT={os.environ.get('ROBOTIC_ATTACK_MODEL_ROOT')}")
+
+    bddl_root = get_libero_path("bddl_files")
+    _libero_env_debug_log(f"bddl_root={bddl_root}")
+    _libero_env_debug_log(f"bddl_root_exists={os.path.exists(bddl_root)}")
+
+    task_bddl_file = os.path.join(bddl_root, task.problem_folder, task.bddl_file)
+    _libero_env_debug_log(f"task_problem_folder={task.problem_folder}")
+    _libero_env_debug_log(f"task_bddl_file={task_bddl_file}")
+    _libero_env_debug_log(f"task_bddl_exists={os.path.exists(task_bddl_file)}")
+
+    default_dataset_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../../../LIBERO/libero/datasets")
+    )
+    libero_default_dataset_path = os.path.abspath(
+        os.path.join("/home/zifeng/siyuan/code/LIBERO/libero/libero/../datasets")
+    )
+    _libero_env_debug_log(f"default_dataset_path_guess={default_dataset_path}")
+    _libero_env_debug_log(f"default_dataset_path_guess_exists={os.path.exists(default_dataset_path)}")
+    _libero_env_debug_log(f"libero_default_dataset_path={libero_default_dataset_path}")
+    _libero_env_debug_log(f"libero_default_dataset_path_exists={os.path.exists(libero_default_dataset_path)}")
+
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+    }
+    _libero_env_debug_log(f"OffScreenRenderEnv init start env_args={env_args}")
+
     env = OffScreenRenderEnv(**env_args)
+
+    _libero_env_debug_log("OffScreenRenderEnv init done")
+    _libero_env_debug_log("env.seed start")
+
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+
+    _libero_env_debug_log("env.seed done")
     return env, task_description
 
 
