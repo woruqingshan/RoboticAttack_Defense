@@ -2,7 +2,6 @@
 #./setup_robotic_attack_env.sh
 #bash setup_robotic_attack_env.sh
 #hf auth login
-# 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
 
 #source /etc/network_turbo
 
